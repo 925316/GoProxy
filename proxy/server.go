@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -153,9 +154,20 @@ func sourceFilterFromMode(mode string) string {
 	}
 }
 
-// handleHTTP 处理普通 HTTP 请求（带自动重试）
+// handleHTTP 处理普通 HTTP 请求（带自动重试 + 429 冷却换节点）
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var tried []string
+	// 循环前一次性读取请求体，避免重试时 r.Body 已被耗尽导致空 body
+	var bodyBytes []byte
+	if r.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		r.Body.Close()
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+	}
 	for attempt := 0; attempt <= s.cfg.MaxRetry; attempt++ {
 		p, err := s.selectProxy(tried, s.mode == "lowest-latency")
 		if err != nil {
@@ -172,12 +184,19 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 转发请求（使用完整 URL，上游代理通过 client transport 设置）
-		req, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+		var body io.Reader
+		if len(bodyBytes) > 0 {
+			body = bytes.NewReader(bodyBytes)
+		}
+		req, err := http.NewRequest(r.Method, r.URL.String(), body)
 		if err != nil {
 			continue
 		}
 		req.Header = r.Header.Clone()
 		req.Header.Del("Proxy-Connection")
+		if len(bodyBytes) > 0 {
+			req.ContentLength = int64(len(bodyBytes))
+		}
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -186,7 +205,16 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			removeOrDisableProxy(s.storage, p)
 			continue
 		}
-		defer resp.Body.Close()
+
+		// 429：上游按出口 IP 限流，冷却该节点并换下一个重试（不删除、不加 fail_count）
+		if resp.StatusCode == http.StatusTooManyRequests {
+			cd := retryAfterOr(resp.Header.Get("Retry-After"), time.Duration(s.cfg.CooldownSeconds)*time.Second)
+			log.Printf("[proxy] ⚠️  429 %s via %s -> 冷却 %s，换节点重试", r.RequestURI, p.Address, cd)
+			resp.Body.Close()
+			s.storage.RecordProxyUse(p.Address, false)
+			s.storage.SetCooldown(p.Address, cd)
+			continue
+		}
 
 		// 写回响应
 		for k, vv := range resp.Header {
@@ -196,10 +224,9 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
+		resp.Body.Close()
 		s.storage.RecordProxyUse(p.Address, true)
-		if resp.StatusCode == 429 {
-			log.Printf("[proxy] ⚠️  429 %s via %s (protocol=%s)", r.RequestURI, p.Address, p.Protocol)
-		} else {
+		if resp.StatusCode >= 400 {
 			log.Printf("[proxy] %s via %s -> %d", r.RequestURI, p.Address, resp.StatusCode)
 		}
 		return

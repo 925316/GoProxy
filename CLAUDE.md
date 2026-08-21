@@ -63,9 +63,10 @@ main.go (orchestrator)
   │   ├── parser.go   — Clash YAML / plain / base64 subscription parser
   │   ├── singbox.go  — sing-box process manager (config generation, start/stop/reload)
   │   └── manager.go  — Subscription refresh loop + probe-wake loop for disabled proxies
-  ├── proxy/      — Outward-facing proxy servers
-  │   ├── server.go       — HTTP proxy (implements http.Handler)
-  │   └── socks5_server.go — SOCKS5 proxy (raw TCP, manual protocol implementation)
+   ├── proxy/      — Outward-facing proxy servers
+   │   ├── server.go       — HTTP proxy (implements http.Handler)
+   │   ├── socks5_server.go — SOCKS5 proxy (raw TCP, manual protocol implementation)
+   │   └── gateway.go      — API reverse-proxy gateway (HTTP-terminal, sees upstream status/body; 429/EOF smart cooldown)
   ├── webui/      — Dashboard server (embedded HTML in html.go, API in dashboard.go)
   └── logger/     — In-memory log collector for WebUI display
 ```
@@ -97,10 +98,11 @@ main.go (orchestrator)
 | 7778 | WebUI dashboard |
 | 7779 | SOCKS5 proxy (random rotation mode) |
 | 7780 | SOCKS5 proxy (lowest-latency mode) |
+| 8888 | API reverse-proxy gateway (`GATEWAY_PORT`, forwards to `UPSTREAM_BASE_URL`) |
 
 ### Configuration
 
-- Environment variables: `WEBUI_PASSWORD`, `PROXY_AUTH_ENABLED`, `PROXY_AUTH_USERNAME`, `PROXY_AUTH_PASSWORD`, `BLOCKED_COUNTRIES`, `ALLOWED_COUNTRIES`, `DATA_DIR`
+- Environment variables: `WEBUI_PASSWORD`, `PROXY_AUTH_ENABLED`, `PROXY_AUTH_USERNAME`, `PROXY_AUTH_PASSWORD`, `BLOCKED_COUNTRIES`, `ALLOWED_COUNTRIES`, `DATA_DIR`, `GATEWAY_PORT`, `UPSTREAM_BASE_URL`, `COOLDOWN_SECONDS`, `EOF_THRESHOLD`
 - Persistent config: `config.json` (or `$DATA_DIR/config.json`) — pool capacity, latency thresholds, intervals, geo-filter (blocked/allowed countries). Editable via WebUI.
 - Config is loaded once at startup via `config.Load()`, updated in-memory via `config.Save()`. Thread-safe via `sync.RWMutex`.
 - Geo-filter: `ALLOWED_COUNTRIES` (whitelist) takes priority over `BLOCKED_COUNTRIES` (blacklist). When whitelist is non-empty, only listed countries are admitted; blacklist is ignored. Both are comma-separated country codes (e.g. `US,JP,KR`). Configurable at runtime via WebUI; `config.json` values override env vars after first save.
@@ -115,7 +117,7 @@ The entire frontend is embedded as Go string literals in `webui/html.go`. The se
 
 ## Code Conventions
 
-- All log messages use `[module]` prefix: `[pool]`, `[fetch]`, `[health]`, `[optimize]`, `[monitor]`, `[socks5]`, `[proxy]`, `[tunnel]`, `[storage]`, `[source]`
+- All log messages use `[module]` prefix: `[pool]`, `[fetch]`, `[health]`, `[optimize]`, `[monitor]`, `[socks5]`, `[proxy]`, `[tunnel]`, `[storage]`, `[source]`, `[gateway]`
 - Comments and log messages are in Chinese
 - Quality grades: S (≤500ms), A (501-1000ms), B (1001-2000ms), C (>2000ms)
 - `storage.Proxy` is the shared data type across all modules

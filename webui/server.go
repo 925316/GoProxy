@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -87,6 +88,8 @@ func (s *Server) Start() {
 	mux.HandleFunc("/api/pool/status", s.readOnlyMiddleware(s.apiPoolStatus))
 	mux.HandleFunc("/api/pool/quality", s.readOnlyMiddleware(s.apiQualityDistribution))
 	mux.HandleFunc("/api/config", s.readOnlyMiddleware(s.apiConfig))
+	mux.HandleFunc("/api/cooldown", s.readOnlyMiddleware(s.apiCooldownProxies))
+	mux.HandleFunc("/api/cooldown/clear", s.authMiddleware(s.apiClearCooldown))
 	mux.HandleFunc("/api/auth/check", s.apiAuthCheck) // 检查登录状态
 	
 	// 管理员 API（需要登录）
@@ -390,6 +393,12 @@ func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 		"custom_free_priority":    cfg.CustomFreePriority,
 		"custom_probe_interval":   cfg.CustomProbeInterval,
 		"custom_refresh_interval": cfg.CustomRefreshInterval,
+
+		// 429 冷却配置
+		"cooldown_seconds":  cfg.CooldownSeconds,
+		"upstream_base_url": cfg.UpstreamBaseURL,
+		"gateway_port":      cfg.GatewayPort,
+		"eof_threshold":     cfg.EofThreshold,
 	})
 }
 
@@ -420,6 +429,12 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 		CustomFreePriority    *bool    `json:"custom_free_priority"`
 		CustomProbeInterval   int      `json:"custom_probe_interval"`
 		CustomRefreshInterval int      `json:"custom_refresh_interval"`
+
+		// 429 冷却配置（仅两个 *string 字段支持显式传空串清空；int 字段传 >0 才生效）
+		CooldownSeconds int     `json:"cooldown_seconds"`
+		UpstreamBaseURL *string `json:"upstream_base_url"`
+		GatewayPort     *string `json:"gateway_port"`
+		EofThreshold    int     `json:"eof_threshold"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -475,6 +490,25 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 	if req.CustomRefreshInterval > 0 {
 		newCfg.CustomRefreshInterval = req.CustomRefreshInterval
 	}
+	if req.CooldownSeconds > 0 {
+		newCfg.CooldownSeconds = req.CooldownSeconds
+	}
+	if req.UpstreamBaseURL != nil {
+		newCfg.UpstreamBaseURL = strings.TrimSpace(*req.UpstreamBaseURL)
+	}
+	if req.GatewayPort != nil {
+		port := strings.TrimSpace(*req.GatewayPort)
+		if port == "" {
+			// 显式清空 = 回退默认端口（空串会让 ListenAndServe 监听随机端口）
+			port = ":8888"
+		} else if !strings.Contains(port, ":") {
+			port = ":" + port // 允许传 "8888"，规范化为 ":8888"
+		}
+		newCfg.GatewayPort = port
+	}
+	if req.EofThreshold > 0 {
+		newCfg.EofThreshold = req.EofThreshold
+	}
 
 	if err := config.Save(&newCfg); err != nil {
 		jsonError(w, "save config error: "+err.Error(), http.StatusInternalServerError)
@@ -515,6 +549,50 @@ func (s *Server) apiQualityDistribution(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	jsonOK(w, dist)
+}
+
+// apiCooldownProxies 获取处于冷却中的代理（只读，访客可访问）
+func (s *Server) apiCooldownProxies(w http.ResponseWriter, r *http.Request) {
+	proxies, err := s.storage.GetCooldownProxies()
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type cooldownProxy struct {
+		ID            int64     `json:"id"`
+		Address       string    `json:"address"`
+		Protocol      string    `json:"protocol"`
+		QualityGrade  string    `json:"quality_grade"`
+		CooldownUntil time.Time `json:"cooldown_until"`
+	}
+	result := make([]cooldownProxy, 0, len(proxies))
+	for _, p := range proxies {
+		result = append(result, cooldownProxy{
+			ID:            p.ID,
+			Address:       p.Address,
+			Protocol:      p.Protocol,
+			QualityGrade:  p.QualityGrade,
+			CooldownUntil: p.CooldownUntil,
+		})
+	}
+	jsonOK(w, result)
+}
+
+// apiClearCooldown 立即解除指定节点的冷却（管理员操作）
+func (s *Server) apiClearCooldown(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Address string `json:"address"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Address == "" {
+		jsonError(w, "address required", http.StatusBadRequest)
+		return
+	}
+	if err := s.storage.ClearCooldown(req.Address); err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[webui] 解除节点冷却: %s", req.Address)
+	jsonOK(w, map[string]bool{"ok": true})
 }
 
 // ========== 订阅管理 API ==========

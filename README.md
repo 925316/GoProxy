@@ -2,14 +2,13 @@
 
 > **智能代理池系统** — 基于 Go 的轻量级、自适应代理池服务，支持免费代理自动抓取 + 付费订阅导入
 
-[![Docker Hub](https://img.shields.io/docker/v/isboyjc/goproxy?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/isboyjc/goproxy)
-[![GitHub Container Registry](https://img.shields.io/badge/GHCR-latest-blue?logo=github)](https://github.com/isboyjc/GoProxy/pkgs/container/goproxy)
+[![GitHub Container Registry](https://img.shields.io/badge/GHCR-latest-blue?logo=github)](https://github.com/925316/GoProxy/pkgs/container/goproxy)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go)](https://go.dev/)
 
 GoProxy 从公开代理源自动抓取 HTTP/SOCKS5 代理，同时支持导入 Clash/V2ray 付费订阅，通过出口 IP + 地理位置 + 延迟三重验证后统一入池，对外提供 HTTP 和 SOCKS5 双协议代理服务。
 
-**GitHub**：[github.com/isboyjc/GoProxy](https://github.com/isboyjc/GoProxy)
+**GitHub**：[github.com/925316/GoProxy](https://github.com/925316/GoProxy)
 
 ![](https://cdn.amux.ai/data/1322149f78ab57adb821ce731c11a9e944504649.png)
 
@@ -189,7 +188,7 @@ docker run -d --name proxygo \
   -e PROXY_AUTH_USERNAME=myuser \
   -e PROXY_AUTH_PASSWORD=mypass \
   -v goproxy-data:/app/data \
-  ghcr.io/isboyjc/goproxy:latest
+  ghcr.io/925316/goproxy:latest
 ```
 
 ### 数据持久化

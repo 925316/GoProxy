@@ -28,6 +28,8 @@ type Proxy struct {
 	Status         string    `json:"status"`
 	Source         string    `json:"source"`          // "free" 或 "custom"
 	SubscriptionID int64    `json:"subscription_id"` // 所属订阅ID（0=免费代理）
+	CooldownUntil  time.Time `json:"cooldown_until"` // 429/限流冷却截止时间（零值=不在冷却中）
+	EofCount       int       `json:"eof_count"`      // 流式响应中途 EOF 计数（达阈值触发冷却）
 }
 
 // Subscription 订阅信息
@@ -208,6 +210,23 @@ func (s *Storage) initSchema() error {
 		s.db.Exec(`ALTER TABLE proxies ADD COLUMN subscription_id INTEGER NOT NULL DEFAULT 0`)
 	}
 
+	// 迁移：添加 cooldown_until 字段（429/限流冷却，NULL=不在冷却中）
+	var hasCooldown int
+	s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name='cooldown_until'`).Scan(&hasCooldown)
+	if hasCooldown == 0 {
+		log.Println("[storage] 迁移: 添加 cooldown_until 列")
+		s.db.Exec(`ALTER TABLE proxies ADD COLUMN cooldown_until DATETIME`)
+	}
+	s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_cooldown_until ON proxies(cooldown_until)`)
+
+	// 迁移：添加 eof_count 字段（流式响应中途 EOF 计数，达阈值触发 24h 冷却）
+	var hasEofCount int
+	s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('proxies') WHERE name='eof_count'`).Scan(&hasEofCount)
+	if hasEofCount == 0 {
+		log.Println("[storage] 迁移: 添加 eof_count 列")
+		s.db.Exec(`ALTER TABLE proxies ADD COLUMN eof_count INTEGER NOT NULL DEFAULT 0`)
+	}
+
 	// 创建订阅表
 	_, err = s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS subscriptions (
@@ -282,12 +301,13 @@ func (s *Storage) AddProxies(proxies []Proxy) error {
 	return tx.Commit()
 }
 
-// GetRandom 随机取一个可用代理（优先选择质量高的）
+// GetRandom 随机取一个可用代理（优先选择质量高的，排除冷却中）
 func (s *Storage) GetRandom() (*Proxy, error) {
 	rows, err := s.db.Query(
 		`SELECT `+proxyColumns+`
 		 FROM proxies
 		 WHERE status = 'active' AND fail_count < 3
+		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)
 		 ORDER BY
 		   CASE quality_grade
 		     WHEN 'S' THEN 1
@@ -311,17 +331,17 @@ func (s *Storage) GetRandom() (*Proxy, error) {
 
 // proxyColumns 代理表查询的标准列列表
 const proxyColumns = `id, address, protocol, exit_ip, exit_location, latency, quality_grade,
-	use_count, success_count, fail_count, last_used, last_check, created_at, status, source, subscription_id`
+	use_count, success_count, fail_count, last_used, last_check, created_at, status, source, subscription_id, cooldown_until, eof_count`
 
 // scanProxy 扫描代理行数据
 func scanProxy(rows *sql.Rows) (*Proxy, error) {
 	p := &Proxy{}
-	var lastUsed, lastCheck sql.NullTime
+	var lastUsed, lastCheck, cooldownUntil sql.NullTime
 	var source sql.NullString
 	var subID sql.NullInt64
 	if err := rows.Scan(&p.ID, &p.Address, &p.Protocol, &p.ExitIP, &p.ExitLocation,
 		&p.Latency, &p.QualityGrade, &p.UseCount, &p.SuccessCount, &p.FailCount,
-		&lastUsed, &lastCheck, &p.CreatedAt, &p.Status, &source, &subID); err != nil {
+		&lastUsed, &lastCheck, &p.CreatedAt, &p.Status, &source, &subID, &cooldownUntil, &p.EofCount); err != nil {
 		return nil, err
 	}
 	if lastUsed.Valid {
@@ -329,6 +349,9 @@ func scanProxy(rows *sql.Rows) (*Proxy, error) {
 	}
 	if lastCheck.Valid {
 		p.LastCheck = lastCheck.Time
+	}
+	if cooldownUntil.Valid {
+		p.CooldownUntil = cooldownUntil.Time
 	}
 	if source.Valid {
 		p.Source = source.String
@@ -346,12 +369,13 @@ func (s *Storage) GetAll() ([]Proxy, error) {
 	return s.GetAllFiltered("")
 }
 
-// GetAllFiltered 获取可用代理（可按来源过滤）
+// GetAllFiltered 获取可用代理（可按来源过滤，自动排除冷却中的节点）
 // sourceFilter: "" = 全部, "free" = 仅免费, "custom" = 仅订阅
 func (s *Storage) GetAllFiltered(sourceFilter string) ([]Proxy, error) {
 	query := `SELECT ` + proxyColumns + `
 		 FROM proxies
-		 WHERE status IN ('active', 'degraded') AND fail_count < 3`
+		 WHERE status IN ('active', 'degraded') AND fail_count < 3
+		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)`
 	var args []interface{}
 	if sourceFilter != "" {
 		query += ` AND source = ?`
@@ -360,6 +384,69 @@ func (s *Storage) GetAllFiltered(sourceFilter string) ([]Proxy, error) {
 	query += ` ORDER BY latency ASC`
 
 	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var proxies []Proxy
+	for rows.Next() {
+		p, err := scanProxy(rows)
+		if err != nil {
+			return nil, err
+		}
+		proxies = append(proxies, *p)
+	}
+	return proxies, nil
+}
+
+// SetCooldown 将节点加入冷却区（429/上游限流/EOF 超阈值），duration 秒后自动回池
+// 同时清零 eof_count：冷却结束后重新计数，避免历史 EOF 永久累积
+func (s *Storage) SetCooldown(address string, duration time.Duration) error {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET cooldown_until = datetime('now', ?), eof_count = 0 WHERE address = ?`,
+		fmt.Sprintf("+%d seconds", int(duration.Seconds())), address,
+	)
+	if err != nil {
+		log.Printf("[storage] SetCooldown %s 出错: %v", address, err)
+	}
+	return err
+}
+
+// RecordEof 记录一次流式响应中途 EOF，返回累计后的 eof_count
+func (s *Storage) RecordEof(address string) (int, error) {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET eof_count = eof_count + 1 WHERE address = ?`,
+		address,
+	)
+	if err != nil {
+		log.Printf("[storage] RecordEof %s 出错: %v", address, err)
+		return 0, err
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT eof_count FROM proxies WHERE address = ?`, address).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+// ClearCooldown 立即解除节点冷却
+func (s *Storage) ClearCooldown(address string) error {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET cooldown_until = NULL WHERE address = ?`,
+		address,
+	)
+	return err
+}
+
+// GetCooldownProxies 获取所有处于冷却中的代理
+func (s *Storage) GetCooldownProxies() ([]Proxy, error) {
+	rows, err := s.db.Query(
+		`SELECT `+proxyColumns+`
+		 FROM proxies
+		 WHERE cooldown_until IS NOT NULL AND cooldown_until > CURRENT_TIMESTAMP
+		 ORDER BY cooldown_until ASC`,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -672,11 +759,12 @@ func (s *Storage) GetQualityDistribution() (map[string]int, error) {
 	return dist, nil
 }
 
-// GetBatchForHealthCheck 获取一批需要健康检查的代理
+// GetBatchForHealthCheck 获取一批需要健康检查的代理（排除冷却中的）
 func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool) ([]Proxy, error) {
 	query := `SELECT ` + proxyColumns + `
 		 FROM proxies
-		 WHERE status IN ('active', 'degraded') AND fail_count < 3`
+		 WHERE status IN ('active', 'degraded') AND fail_count < 3
+		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)`
 
 	if skipSGrade {
 		query += ` AND quality_grade != 'S'`
@@ -921,21 +1009,22 @@ func (s *Storage) DisableProxy(address string) error {
 	return err
 }
 
-// EnableProxy 启用代理（从禁用状态恢复）
+// EnableProxy 启用代理（从禁用状态恢复，同时清除冷却）
 func (s *Storage) EnableProxy(address string) error {
 	_, err := s.db.Exec(
-		`UPDATE proxies SET status = 'active', fail_count = 0 WHERE address = ?`,
+		`UPDATE proxies SET status = 'active', fail_count = 0, cooldown_until = NULL WHERE address = ?`,
 		address,
 	)
 	return err
 }
 
-// GetDisabledCustomProxies 获取所有被禁用的订阅代理
+// GetDisabledCustomProxies 获取所有被禁用的订阅代理（排除仍在冷却中的，冷却中的不唤醒）
 func (s *Storage) GetDisabledCustomProxies() ([]Proxy, error) {
 	rows, err := s.db.Query(
 		`SELECT `+proxyColumns+`
 		 FROM proxies
-		 WHERE source = 'custom' AND status = 'disabled'`,
+		 WHERE source = 'custom' AND status = 'disabled'
+		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)`,
 	)
 	if err != nil {
 		return nil, err

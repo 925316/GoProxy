@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -96,6 +97,12 @@ type Config struct {
 	SingBoxPath           string // sing-box 二进制路径（默认 "sing-box"）
 	SingBoxBasePort       int    // sing-box 本地端口起始（默认 20000）
 
+	// ========== 429 限流冷却配置 ==========
+	CooldownSeconds int    // 节点收到 429 后的冷却秒数（默认 86400=24h）
+	UpstreamBaseURL string // API 网关转发的上游 base URL（必填，指向你的 API 服务，如 https://your-api.example.com）
+	GatewayPort     string // API 网关监听端口（默认 :8888）
+	EofThreshold    int    // 流式响应 EOF 次数阈值，达到后冷却该节点（默认 3，冷却时长复用 CooldownSeconds）
+
 	// ========== 兼容旧配置 ==========
 	MaxResponseMs int // 已废弃，使用 MaxLatencyMs 替代
 	MaxFailCount  int // 代理失败次数阈值
@@ -173,6 +180,28 @@ func DefaultConfig() *Config {
 		singBoxPath = "sing-box"
 	}
 
+	// 读取 429 冷却配置
+	cooldownSeconds := 86400 // 默认 24h
+	if env := os.Getenv("COOLDOWN_SECONDS"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			cooldownSeconds = v
+		}
+	}
+	upstreamBaseURL := os.Getenv("UPSTREAM_BASE_URL")
+	eofThreshold := 3 // 默认：3 次 EOF 触发冷却
+	if env := os.Getenv("EOF_THRESHOLD"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			eofThreshold = v
+		}
+	}
+	gatewayPort := ":8888" // 默认网关地址
+	if env := os.Getenv("GATEWAY_PORT"); env != "" {
+		gatewayPort = env
+		if !strings.Contains(gatewayPort, ":") {
+			gatewayPort = ":" + gatewayPort
+		}
+	}
+
 	return &Config{
 		// 基础服务配置
 		WebUIPort:         ":7778",
@@ -234,6 +263,12 @@ func DefaultConfig() *Config {
 		CustomRefreshInterval: 60,
 		SingBoxPath:           singBoxPath,
 		SingBoxBasePort:       20000,
+
+		// 429 限流冷却配置
+		CooldownSeconds: cooldownSeconds,
+		UpstreamBaseURL: upstreamBaseURL,
+		GatewayPort:     gatewayPort,
+		EofThreshold:    eofThreshold,
 
 		// 兼容旧配置
 		MaxResponseMs: 5000,
@@ -337,6 +372,21 @@ func Load() *Config {
 			if saved.SingBoxBasePort > 0 {
 				cfg.SingBoxBasePort = saved.SingBoxBasePort
 			}
+
+			// 429 冷却配置（config.json 优先于环境变量默认值）
+			if saved.CooldownSeconds > 0 {
+				cfg.CooldownSeconds = saved.CooldownSeconds
+			}
+			if saved.UpstreamBaseURL != nil {
+				// 指针非 nil 即生效（含显式清空为空串），否则清空操作重启后会丢失
+				cfg.UpstreamBaseURL = *saved.UpstreamBaseURL
+			}
+			if saved.GatewayPort != nil && *saved.GatewayPort != "" {
+				cfg.GatewayPort = *saved.GatewayPort
+			}
+			if saved.EofThreshold > 0 {
+				cfg.EofThreshold = saved.EofThreshold
+			}
 		}
 	}
 	cfgMu.Lock()
@@ -389,6 +439,12 @@ type savedConfig struct {
 	SingBoxPath           string `json:"singbox_path,omitempty"`
 	SingBoxBasePort       int    `json:"singbox_base_port,omitempty"`
 
+	// 429 冷却配置（指针字段：nil=未设置沿用 env 默认值；非 nil 含空串=显式清空）
+	CooldownSeconds int     `json:"cooldown_seconds,omitempty"`
+	UpstreamBaseURL *string `json:"upstream_base_url"`
+	GatewayPort     *string `json:"gateway_port"`
+	EofThreshold    int     `json:"eof_threshold,omitempty"`
+
 	// 兼容旧配置
 	FetchInterval int `json:"fetch_interval,omitempty"`
 	CheckInterval int `json:"check_interval,omitempty"`
@@ -424,6 +480,10 @@ func Save(cfg *Config) error {
 		CustomRefreshInterval: cfg.CustomRefreshInterval,
 		SingBoxPath:           cfg.SingBoxPath,
 		SingBoxBasePort:       cfg.SingBoxBasePort,
+		CooldownSeconds:       cfg.CooldownSeconds,
+		UpstreamBaseURL:       &cfg.UpstreamBaseURL,
+		GatewayPort:           &cfg.GatewayPort,
+		EofThreshold:          cfg.EofThreshold,
 		FetchInterval:         cfg.FetchInterval,
 		CheckInterval:         cfg.CheckInterval,
 	}, "", "  ")

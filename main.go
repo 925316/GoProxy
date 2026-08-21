@@ -90,6 +90,9 @@ func main() {
 	socks5RandomServer := proxy.NewSOCKS5(store, cfg, "random", cfg.SOCKS5Port)
 	socks5StableServer := proxy.NewSOCKS5(store, cfg, "lowest-latency", cfg.StableSOCKS5Port)
 
+	// API 反向代理网关（429 智能检测核心）
+	gatewayServer := proxy.NewGateway(store, cfg, cfg.GatewayPort)
+
 	// 初始化订阅管理器
 	customMgr := custom.NewManager(store, validate, cfg)
 
@@ -134,6 +137,9 @@ func main() {
 		}
 	}()
 
+	// 启动 API 反向代理网关（429 智能检测）
+	startGateway(gatewayServer)
+
 	// 启动 SOCKS5 稳定代理服务（最低延迟模式）
 	go func() {
 		if err := socks5StableServer.Start(); err != nil {
@@ -152,6 +158,15 @@ func main() {
 	if err := randomServer.Start(); err != nil {
 		log.Fatalf("random http proxy server: %v", err)
 	}
+}
+
+// startGateway 启动 API 反向代理网关（goroutine 包装）
+func startGateway(g *proxy.Gateway) {
+	go func() {
+		if err := g.Start(); err != nil {
+			log.Fatalf("[gateway] 网关启动失败: %v", err)
+		}
+	}()
 }
 
 // smartFetchAndFill 智能抓取和填充

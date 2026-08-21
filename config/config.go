@@ -96,6 +96,7 @@ type Config struct {
 	CustomRefreshInterval int    // 默认订阅刷新间隔（分钟，默认 60）
 	SingBoxPath           string // sing-box 二进制路径（默认 "sing-box"）
 	SingBoxBasePort       int    // sing-box 本地端口起始（默认 20000）
+	SingBoxInsecure       bool   // sing-box 出站强制跳过 TLS 证书验证（env SINGBOX_INSECURE）
 
 	// ========== 429 限流冷却配置 ==========
 	CooldownSeconds int    // 节点收到 429 后的冷却秒数（默认 86400=24h）
@@ -263,6 +264,7 @@ func DefaultConfig() *Config {
 		CustomRefreshInterval: 60,
 		SingBoxPath:           singBoxPath,
 		SingBoxBasePort:       20000,
+		SingBoxInsecure:       os.Getenv("SINGBOX_INSECURE") == "1" || strings.EqualFold(os.Getenv("SINGBOX_INSECURE"), "true"),
 
 		// 429 限流冷却配置
 		CooldownSeconds: cooldownSeconds,
@@ -372,6 +374,7 @@ func Load() *Config {
 			if saved.SingBoxBasePort > 0 {
 				cfg.SingBoxBasePort = saved.SingBoxBasePort
 			}
+			cfg.SingBoxInsecure = saved.SingBoxInsecure
 
 			// 429 冷却配置（config.json 优先于环境变量默认值）
 			if saved.CooldownSeconds > 0 {
@@ -438,6 +441,7 @@ type savedConfig struct {
 	CustomRefreshInterval int    `json:"custom_refresh_interval,omitempty"`
 	SingBoxPath           string `json:"singbox_path,omitempty"`
 	SingBoxBasePort       int    `json:"singbox_base_port,omitempty"`
+	SingBoxInsecure       bool   `json:"singbox_insecure,omitempty"`
 
 	// 429 冷却配置（指针字段：nil=未设置沿用 env 默认值；非 nil 含空串=显式清空）
 	CooldownSeconds int     `json:"cooldown_seconds,omitempty"`
@@ -480,6 +484,7 @@ func Save(cfg *Config) error {
 		CustomRefreshInterval: cfg.CustomRefreshInterval,
 		SingBoxPath:           cfg.SingBoxPath,
 		SingBoxBasePort:       cfg.SingBoxBasePort,
+		SingBoxInsecure:       cfg.SingBoxInsecure,
 		CooldownSeconds:       cfg.CooldownSeconds,
 		UpstreamBaseURL:       &cfg.UpstreamBaseURL,
 		GatewayPort:           &cfg.GatewayPort,

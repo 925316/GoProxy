@@ -122,7 +122,11 @@ func looksLikeProxyLinks(s string) bool {
 		strings.Contains(s, "ssr://") ||
 		strings.Contains(s, "hysteria2://") ||
 		strings.Contains(s, "hy2://") ||
-		strings.Contains(s, "tuic://")
+		strings.Contains(s, "tuic://") ||
+		strings.Contains(s, "anytls://") ||
+		strings.Contains(s, "socks5://") ||
+		strings.Contains(s, "http://") ||
+		strings.Contains(s, "https://")
 }
 
 // clashConfig Clash YAML 配置结构（兼容新旧格式）
@@ -444,9 +448,40 @@ func parseProxyLink(link string) (*ParsedNode, error) {
 		return parseStandardLink(link, "hysteria2")
 	case strings.HasPrefix(link, "tuic://"):
 		return parseStandardLink(link, "tuic")
+	case strings.HasPrefix(link, "anytls://"):
+		return parseStandardLink(link, "anytls")
+	case strings.HasPrefix(link, "socks5://"), strings.HasPrefix(link, "socks5h://"):
+		return parseDirectLink(link, "socks5")
+	case strings.HasPrefix(link, "http://"), strings.HasPrefix(link, "https://"):
+		return parseDirectLink(link, "http")
 	default:
 		return nil, fmt.Errorf("不支持的协议链接: %s", link[:min(20, len(link))])
 	}
+}
+
+// parseDirectLink 解析直连代理链接（socks5://、http://、https://）
+// 这类节点无需 sing-box 转换，直接以 address:port 形式入池
+func parseDirectLink(link string, typ string) (*ParsedNode, error) {
+	u, err := url.Parse(link)
+	if err != nil {
+		return nil, fmt.Errorf("链接解析失败: %w", err)
+	}
+	host := u.Hostname()
+	port, _ := strconv.Atoi(u.Port())
+	if host == "" || port == 0 {
+		return nil, fmt.Errorf("缺少 host 或 port: %s", link[:min(20, len(link))])
+	}
+	name := u.Fragment
+	if name == "" {
+		name = net.JoinHostPort(host, strconv.Itoa(port))
+	}
+	return &ParsedNode{
+		Name:   name,
+		Type:   typ,
+		Server: host,
+		Port:   port,
+		Raw:    map[string]interface{}{"type": typ, "server": host, "port": port},
+	}, nil
 }
 
 // parseVmessLink 解析 vmess:// 链接（V2rayN JSON base64 格式）
@@ -547,7 +582,7 @@ func parseStandardLink(link string, typ string) (*ParsedNode, error) {
 	// 用户信息（password/uuid）
 	if u.User != nil {
 		password := u.User.Username()
-		if typ == "trojan" || typ == "hysteria2" {
+		if typ == "trojan" || typ == "hysteria2" || typ == "anytls" {
 			raw["password"] = password
 		} else if typ == "vless" || typ == "tuic" {
 			raw["uuid"] = password
@@ -565,7 +600,7 @@ func parseStandardLink(link string, typ string) (*ParsedNode, error) {
 	if security == "" {
 		security = params.Get("type") // 有些链接用 type 表示
 	}
-	if security != "none" && security != "" || typ == "trojan" || typ == "hysteria2" {
+	if security != "none" && security != "" || typ == "trojan" || typ == "hysteria2" || typ == "anytls" {
 		raw["tls"] = true
 		if sni := params.Get("sni"); sni != "" {
 			raw["sni"] = sni

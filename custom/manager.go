@@ -34,6 +34,7 @@ func NewManager(store *storage.Storage, v *validator.Validator, cfg *config.Conf
 	if d := os.Getenv("DATA_DIR"); d != "" {
 		dataDir = d
 	}
+	SingBoxInsecure = cfg.SingBoxInsecure
 
 	return &Manager{
 		storage:   store,

@@ -14,6 +14,10 @@ import (
 	"time"
 )
 
+// SingBoxInsecure 全局强制 sing-box 出站跳过 TLS 证书验证
+// （复刻旧版 easy-proxies 的 skip_cert_verify: true 行为，由 config 注入）
+var SingBoxInsecure bool
+
 // SingBoxProcess 管理 sing-box 子进程
 type SingBoxProcess struct {
 	cmd        *exec.Cmd
@@ -251,7 +255,7 @@ func applyTLS(raw map[string]interface{}, out map[string]interface{}) {
 		tlsConfig["server_name"] = servername
 	}
 
-	if getBool(raw, "skip-cert-verify") {
+	if getBool(raw, "skip-cert-verify") || SingBoxInsecure {
 		tlsConfig["insecure"] = true
 	}
 

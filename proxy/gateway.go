@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -32,6 +33,9 @@ type Gateway struct {
 	storage *storage.Storage
 	cfg     *config.Config
 	port    string
+
+	stickyAddr string
+	stickyMu   sync.RWMutex
 }
 
 // NewGateway 创建 API 反向代理网关
@@ -71,8 +75,36 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // abandon 当前节点判废：记失败 + 冷却，由调用方 continue 换节点。
 // 429 场景传入解析后的 Retry-After，其余传默认 cooldown。
 func (g *Gateway) abandon(p *storage.Proxy, d time.Duration) {
+	g.clearStickyIf(p.Address)
 	g.storage.RecordProxyUse(p.Address, false)
 	g.storage.SetCooldown(p.Address, d)
+}
+
+// getSticky 返回当前粘性节点地址（空串=未粘定）
+func (g *Gateway) getSticky() string {
+	g.stickyMu.RLock()
+	defer g.stickyMu.RUnlock()
+	return g.stickyAddr
+}
+
+// setSticky 粘定成功节点；切换时打一行日志
+func (g *Gateway) setSticky(addr string) {
+	g.stickyMu.Lock()
+	old := g.stickyAddr
+	g.stickyAddr = addr
+	g.stickyMu.Unlock()
+	if old != addr {
+		log.Printf("[gateway] sticky %s -> %s", old, addr)
+	}
+}
+
+// clearStickyIf 仅当粘性地址等于给定地址时清除（判废路径用）
+func (g *Gateway) clearStickyIf(addr string) {
+	g.stickyMu.Lock()
+	defer g.stickyMu.Unlock()
+	if g.stickyAddr == addr {
+		g.stickyAddr = ""
+	}
 }
 
 // forward 选节点转发：任何异常 -> 冷却 + 换下一个，直到重试耗尽
@@ -234,6 +266,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request) {
 					g.abandon(p, cooldown)
 				} else {
 					g.storage.RecordProxyUse(p.Address, true)
+					g.setSticky(p.Address)
 				}
 				resp.Body.Close()
 				return
@@ -451,10 +484,35 @@ func retryAfterOr(h string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-// selectProxy 选节点（网关固定最低延迟模式）
+// selectProxy 选节点（网关固定最低延迟模式，粘性优先）
 func (g *Gateway) selectProxy(tried []string) (*storage.Proxy, error) {
 	cfg := g.cfg
 	sourceFilter := sourceFilterFromMode(cfg.CustomProxyMode)
+
+	// STICKY 模式：优先复用上次成功节点（仍可用才用）
+	if cfg.GatewaySticky {
+		if sticky := g.getSticky(); sticky != "" {
+			inTried := false
+			for _, t := range tried {
+				if t == sticky {
+					inTried = true
+					break
+				}
+			}
+			if !inTried {
+				if proxies, err := g.storage.GetAllFiltered(sourceFilter); err == nil {
+					for _, p := range proxies {
+						if p.Address == sticky {
+							proxy := p
+							return &proxy, nil
+						}
+					}
+				}
+				// 粘性节点已不在可用列表（冷却/禁用/删除/过滤）-> 解粘，回落常规逻辑
+				g.clearStickyIf(sticky)
+			}
+		}
+	}
 
 	if cfg.CustomProxyMode == "mixed" && (cfg.CustomPriority || cfg.CustomFreePriority) {
 		preferSource := "custom"

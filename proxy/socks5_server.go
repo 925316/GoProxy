@@ -104,15 +104,11 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 			return
 		}
 
-		s.storage.RecordProxyUse(p.Address, true)
 		log.Printf("[socks5] %s via %s established", target, p.Address)
 
-		// 双向转发数据
-		go io.Copy(upstreamConn, clientConn)
-		io.Copy(clientConn, upstreamConn)
-		
-		// 转发完成，关闭连接
-		upstreamConn.Close()
+		// 被动体检：双向转发 + 尸体上报（字节/时长/关闭方/关闭类型），关时再判
+		upBytes, downBytes, lifetime, closer, closeType := relayTunnel(upstreamConn, clientConn)
+		GetScorer().ReportTunnel(p.Address, lifetime, upBytes, downBytes, closer, closeType, s.storage, s.cfg)
 		return
 	}
 

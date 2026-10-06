@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,10 @@ var fetchMu sync.Mutex
 func main() {
 	// 初始化日志收集器
 	logger.Init()
+	// 日志落盘：DATA_DIR/proxy.log（容器内为 /app/data/proxy.log）
+	if d := os.Getenv("DATA_DIR"); d != "" {
+		logger.SetFilePath(filepath.Join(d, "proxy.log"))
+	}
 
 	// 加载配置
 	cfg := config.Load()
@@ -131,33 +136,56 @@ func main() {
 	go watchConfigChanges(configChanged, poolMgr)
 
 	// 启动 HTTP 稳定代理服务（最低延迟模式）
-	go func() {
-		if err := stableServer.Start(); err != nil {
-			log.Fatalf("stable http proxy server: %v", err)
-		}
-	}()
+	if disabledByEnv("DISABLE_STABLE") {
+		log.Println("[main] skip stable http (disabled by env)")
+	} else {
+		go func() {
+			if err := stableServer.Start(); err != nil {
+				log.Fatalf("stable http proxy server: %v", err)
+			}
+		}()
+	}
 
 	// 启动 API 反向代理网关（429 智能检测）
 	startGateway(gatewayServer)
 
 	// 启动 SOCKS5 稳定代理服务（最低延迟模式）
-	go func() {
-		if err := socks5StableServer.Start(); err != nil {
-			log.Fatalf("stable socks5 proxy server: %v", err)
-		}
-	}()
+	if disabledByEnv("DISABLE_SOCKS5_STABLE") {
+		log.Println("[main] skip stable socks5 (disabled by env)")
+	} else {
+		go func() {
+			if err := socks5StableServer.Start(); err != nil {
+				log.Fatalf("stable socks5 proxy server: %v", err)
+			}
+		}()
+	}
 
 	// 启动 SOCKS5 随机代理服务
-	go func() {
-		if err := socks5RandomServer.Start(); err != nil {
-			log.Fatalf("random socks5 proxy server: %v", err)
-		}
-	}()
+	if disabledByEnv("DISABLE_SOCKS5_RANDOM") {
+		log.Println("[main] skip random socks5 (disabled by env)")
+	} else {
+		go func() {
+			if err := socks5RandomServer.Start(); err != nil {
+				log.Fatalf("random socks5 proxy server: %v", err)
+			}
+		}()
+	}
 
 	// 启动 HTTP 随机代理服务（阻塞）
+	if disabledByEnv("DISABLE_RANDOM") {
+		log.Println("[main] skip random http (disabled by env)")
+		// Gateway + WebUI always run: block forever instead of exiting
+		select {}
+	}
 	if err := randomServer.Start(); err != nil {
 		log.Fatalf("random http proxy server: %v", err)
 	}
+}
+
+// disabledByEnv reports whether env key disables a server (1/true/TRUE)
+func disabledByEnv(key string) bool {
+	v := os.Getenv(key)
+	return v == "1" || v == "true" || v == "TRUE"
 }
 
 // startGateway 启动 API 反向代理网关（goroutine 包装）

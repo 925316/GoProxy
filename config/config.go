@@ -103,6 +103,17 @@ type Config struct {
 	UpstreamBaseURL string // API 网关转发的上游 base URL（必填，指向你的 API 服务，如 https://your-api.example.com）
 	GatewayPort     string // API 网关监听端口（默认 :8888）
 	EofThreshold    int    // 流式响应 EOF 次数阈值，达到后冷却该节点（默认 3，冷却时长复用 CooldownSeconds）
+	GatewaySticky   bool   // 网关粘性模式：固定上次成功节点，仅失败时切换（默认 true，env GATEWAY_STICKY）
+
+	// ========== 被动体检配置（零探测，只看真实流量尸体） ==========
+	PassiveEarlyLifetimeSec  int     // 早关判定：存活小于此秒数（默认 5）
+	PassiveEarlyBytes        int     // 早关判定：双向字节小于此值（默认 8192）
+	PassiveSuccessBytes      int     // 成功线：字节超过此值直接算成功（默认 65536，SSE 保命）
+	PassiveSuccessLifetimeSec int    // 成功线：存活超过此秒数直接算成功（默认 30）
+	PassiveConsecThreshold   int     // 连续早关几次后熔断（默认 3）
+	PassiveEjectBaseSec      int     // 熔断基础秒数，指数退避起点（默认 30）
+	PassiveEjectCapSec       int     // 熔断退避上限秒数（默认 300）
+	PassiveMaxEjectPercent   float64 // 同时熔断上限占比，panic 保护（默认 0.5）
 
 	// ========== 兼容旧配置 ==========
 	MaxResponseMs int // 已废弃，使用 MaxLatencyMs 替代
@@ -202,6 +213,63 @@ func DefaultConfig() *Config {
 			gatewayPort = ":" + gatewayPort
 		}
 	}
+	gatewaySticky := true // 默认粘性模式；仅显式 "0"/"false" 关闭
+	if env := os.Getenv("GATEWAY_STICKY"); env != "" {
+		lower := strings.ToLower(strings.TrimSpace(env))
+		if lower == "0" || lower == "false" {
+			gatewaySticky = false
+		}
+	}
+
+	// 读取被动体检配置
+	passiveEarlyLifetimeSec := 5
+	if env := os.Getenv("PASSIVE_EARLY_LIFETIME_SEC"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveEarlyLifetimeSec = v
+		}
+	}
+	passiveEarlyBytes := 8192
+	if env := os.Getenv("PASSIVE_EARLY_BYTES"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveEarlyBytes = v
+		}
+	}
+	passiveSuccessBytes := 65536
+	if env := os.Getenv("PASSIVE_SUCCESS_BYTES"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveSuccessBytes = v
+		}
+	}
+	passiveSuccessLifetimeSec := 30
+	if env := os.Getenv("PASSIVE_SUCCESS_LIFETIME_SEC"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveSuccessLifetimeSec = v
+		}
+	}
+	passiveConsecThreshold := 3
+	if env := os.Getenv("PASSIVE_CONSEC_THRESHOLD"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveConsecThreshold = v
+		}
+	}
+	passiveEjectBaseSec := 30
+	if env := os.Getenv("PASSIVE_EJECT_BASE_SEC"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveEjectBaseSec = v
+		}
+	}
+	passiveEjectCapSec := 300
+	if env := os.Getenv("PASSIVE_EJECT_CAP_SEC"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveEjectCapSec = v
+		}
+	}
+	passiveMaxEjectPercent := 0.5
+	if env := os.Getenv("PASSIVE_MAX_EJECT_PERCENT"); env != "" {
+		if v, err := strconv.ParseFloat(env, 64); err == nil && v > 0 && v <= 1 {
+			passiveMaxEjectPercent = v
+		}
+	}
 
 	return &Config{
 		// 基础服务配置
@@ -271,6 +339,17 @@ func DefaultConfig() *Config {
 		UpstreamBaseURL: upstreamBaseURL,
 		GatewayPort:     gatewayPort,
 		EofThreshold:    eofThreshold,
+		GatewaySticky:   gatewaySticky,
+
+		// 被动体检配置（零探测，只看真实流量尸体）
+		PassiveEarlyLifetimeSec:   passiveEarlyLifetimeSec,
+		PassiveEarlyBytes:         passiveEarlyBytes,
+		PassiveSuccessBytes:       passiveSuccessBytes,
+		PassiveSuccessLifetimeSec: passiveSuccessLifetimeSec,
+		PassiveConsecThreshold:    passiveConsecThreshold,
+		PassiveEjectBaseSec:       passiveEjectBaseSec,
+		PassiveEjectCapSec:        passiveEjectCapSec,
+		PassiveMaxEjectPercent:    passiveMaxEjectPercent,
 
 		// 兼容旧配置
 		MaxResponseMs: 5000,
@@ -387,8 +466,37 @@ func Load() *Config {
 			if saved.GatewayPort != nil && *saved.GatewayPort != "" {
 				cfg.GatewayPort = *saved.GatewayPort
 			}
+			if saved.GatewaySticky != nil {
+				cfg.GatewaySticky = *saved.GatewaySticky
+			}
 			if saved.EofThreshold > 0 {
 				cfg.EofThreshold = saved.EofThreshold
+			}
+
+			// 被动体检配置（config.json 优先于环境变量默认值）
+			if saved.PassiveEarlyLifetimeSec > 0 {
+				cfg.PassiveEarlyLifetimeSec = saved.PassiveEarlyLifetimeSec
+			}
+			if saved.PassiveEarlyBytes > 0 {
+				cfg.PassiveEarlyBytes = saved.PassiveEarlyBytes
+			}
+			if saved.PassiveSuccessBytes > 0 {
+				cfg.PassiveSuccessBytes = saved.PassiveSuccessBytes
+			}
+			if saved.PassiveSuccessLifetimeSec > 0 {
+				cfg.PassiveSuccessLifetimeSec = saved.PassiveSuccessLifetimeSec
+			}
+			if saved.PassiveConsecThreshold > 0 {
+				cfg.PassiveConsecThreshold = saved.PassiveConsecThreshold
+			}
+			if saved.PassiveEjectBaseSec > 0 {
+				cfg.PassiveEjectBaseSec = saved.PassiveEjectBaseSec
+			}
+			if saved.PassiveEjectCapSec > 0 {
+				cfg.PassiveEjectCapSec = saved.PassiveEjectCapSec
+			}
+			if saved.PassiveMaxEjectPercent > 0 && saved.PassiveMaxEjectPercent <= 1 {
+				cfg.PassiveMaxEjectPercent = saved.PassiveMaxEjectPercent
 			}
 		}
 	}
@@ -448,6 +556,17 @@ type savedConfig struct {
 	UpstreamBaseURL *string `json:"upstream_base_url"`
 	GatewayPort     *string `json:"gateway_port"`
 	EofThreshold    int     `json:"eof_threshold,omitempty"`
+	GatewaySticky   *bool   `json:"gateway_sticky,omitempty"`
+
+	// 被动体检配置（全部 omitempty：0 值 = 沿用 env/默认值）
+	PassiveEarlyLifetimeSec   int     `json:"passive_early_lifetime_sec,omitempty"`
+	PassiveEarlyBytes         int     `json:"passive_early_bytes,omitempty"`
+	PassiveSuccessBytes       int     `json:"passive_success_bytes,omitempty"`
+	PassiveSuccessLifetimeSec int     `json:"passive_success_lifetime_sec,omitempty"`
+	PassiveConsecThreshold    int     `json:"passive_consec_threshold,omitempty"`
+	PassiveEjectBaseSec       int     `json:"passive_eject_base_sec,omitempty"`
+	PassiveEjectCapSec        int     `json:"passive_eject_cap_sec,omitempty"`
+	PassiveMaxEjectPercent    float64 `json:"passive_max_eject_percent,omitempty"`
 
 	// 兼容旧配置
 	FetchInterval int `json:"fetch_interval,omitempty"`
@@ -462,6 +581,7 @@ func Save(cfg *Config) error {
 
 	customPriority := cfg.CustomPriority
 	customFreePriority := cfg.CustomFreePriority
+	gatewaySticky := cfg.GatewaySticky
 	data, err := json.MarshalIndent(savedConfig{
 		PoolMaxSize:           cfg.PoolMaxSize,
 		PoolHTTPRatio:         cfg.PoolHTTPRatio,
@@ -489,6 +609,15 @@ func Save(cfg *Config) error {
 		UpstreamBaseURL:       &cfg.UpstreamBaseURL,
 		GatewayPort:           &cfg.GatewayPort,
 		EofThreshold:          cfg.EofThreshold,
+		GatewaySticky:         &gatewaySticky,
+		PassiveEarlyLifetimeSec:   cfg.PassiveEarlyLifetimeSec,
+		PassiveEarlyBytes:         cfg.PassiveEarlyBytes,
+		PassiveSuccessBytes:       cfg.PassiveSuccessBytes,
+		PassiveSuccessLifetimeSec: cfg.PassiveSuccessLifetimeSec,
+		PassiveConsecThreshold:    cfg.PassiveConsecThreshold,
+		PassiveEjectBaseSec:       cfg.PassiveEjectBaseSec,
+		PassiveEjectCapSec:        cfg.PassiveEjectCapSec,
+		PassiveMaxEjectPercent:    cfg.PassiveMaxEjectPercent,
 		FetchInterval:         cfg.FetchInterval,
 		CheckInterval:         cfg.CheckInterval,
 	}, "", "  ")

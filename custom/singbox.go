@@ -363,8 +363,63 @@ func convertPluginOpts(plugin string, opts map[string]interface{}) string {
 	return strings.Join(parts, ";")
 }
 
+// killOldProcessLocked force kills any leftover process before binding new ports (call with lock held)
+func (s *SingBoxProcess) killOldProcessLocked() {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return
+	}
+	// Capture cmd locally: async Wait must not read s.cmd after it is cleared
+	cmd := s.cmd
+	// Kill is idempotent here: ignore already-killed errors
+	_ = cmd.Process.Kill()
+	done := make(chan struct{})
+	go func() {
+		// Wait reaps the child; returns immediately if already waited
+		_ = cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Println("[sing-box] old process killed")
+	case <-time.After(5 * time.Second):
+		log.Println("[sing-box] old process kill timeout, continuing")
+	}
+	s.cmd = nil
+	s.running = false
+}
+
+// waitPortsFreeLocked polls config inbounds until free or 10s timeout (call with lock held)
+func (s *SingBoxProcess) waitPortsFreeLocked() {
+	ports := make([]int, 0, len(s.portMap))
+	for _, p := range s.portMap {
+		ports = append(ports, p)
+	}
+	if len(ports) == 0 && s.basePort > 0 {
+		ports = append(ports, s.basePort+1)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for _, port := range ports {
+		for {
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+			if err != nil {
+				break // port free
+			}
+			conn.Close()
+			if time.Now().After(deadline) {
+				break
+			}
+			log.Printf("[sing-box] port %d still in use, waiting", port)
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+}
+
 // startLocked 启动 sing-box（需持有锁）
 func (s *SingBoxProcess) startLocked() error {
+	// Ensure previous process released its ports before rebinding
+	s.killOldProcessLocked()
+	s.waitPortsFreeLocked()
+
 	binPath, err := exec.LookPath(s.binPath)
 	if err != nil {
 		return fmt.Errorf("sing-box 未找到: %s（请安装 sing-box 或设置 SINGBOX_PATH）", s.binPath)
@@ -451,21 +506,12 @@ func (s *SingBoxProcess) startLocked() error {
 
 // stopLocked 停止 sing-box（需持有锁）
 func (s *SingBoxProcess) stopLocked() {
-	if s.cmd != nil && s.cmd.Process != nil && s.running {
-		log.Println("[custom] 停止 sing-box 进程...")
-		s.cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func() {
-			s.cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			s.cmd.Process.Kill()
-		}
+	if s.cmd == nil || s.cmd.Process == nil {
 		s.running = false
+		return
 	}
+	log.Println("[custom] 停止 sing-box 进程...")
+	s.killOldProcessLocked()
 }
 
 // Stop 停止 sing-box

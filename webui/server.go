@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -349,8 +350,47 @@ func (s *Server) apiRefreshLatency(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiLogs(w http.ResponseWriter, r *http.Request) {
-	lines := logger.GetLines(100)
-	jsonOK(w, map[string]interface{}{"lines": lines})
+	n := 100
+	if ns := strings.TrimSpace(r.URL.Query().Get("n")); ns != "" {
+		if v, err := strconv.Atoi(ns); err == nil {
+			n = v
+		}
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > 5000 {
+		n = 5000
+	}
+	level := strings.TrimSpace(r.URL.Query().Get("level"))
+
+	fetch := n * 2
+	if fetch > 5000 {
+		fetch = 5000
+	}
+	lines := logger.GetLines(fetch)
+	if lines == nil {
+		lines = []string{}
+	}
+	if level != "" {
+		lower := strings.ToLower(level)
+		filtered := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if strings.Contains(strings.ToLower(line), lower) {
+				filtered = append(filtered, line)
+			}
+		}
+		total := len(filtered)
+		if len(filtered) > n {
+			filtered = filtered[len(filtered)-n:]
+		}
+		jsonOK(w, map[string]interface{}{"lines": filtered, "total": total, "n": n})
+		return
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	jsonOK(w, map[string]interface{}{"lines": lines, "total": len(lines), "n": n})
 }
 
 // apiConfig 获取配置
@@ -398,7 +438,19 @@ func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 		"cooldown_seconds":  cfg.CooldownSeconds,
 		"upstream_base_url": cfg.UpstreamBaseURL,
 		"gateway_port":      cfg.GatewayPort,
+		"gateway_sticky":    cfg.GatewaySticky,
+		"log_file":          logger.GetFilePath(),
 		"eof_threshold":     cfg.EofThreshold,
+
+		// 被动体检配置
+		"passive_early_lifetime_sec":   cfg.PassiveEarlyLifetimeSec,
+		"passive_early_bytes":          cfg.PassiveEarlyBytes,
+		"passive_success_bytes":        cfg.PassiveSuccessBytes,
+		"passive_success_lifetime_sec": cfg.PassiveSuccessLifetimeSec,
+		"passive_consec_threshold":     cfg.PassiveConsecThreshold,
+		"passive_eject_base_sec":       cfg.PassiveEjectBaseSec,
+		"passive_eject_cap_sec":        cfg.PassiveEjectCapSec,
+		"passive_max_eject_percent":    cfg.PassiveMaxEjectPercent,
 	})
 }
 
@@ -434,7 +486,18 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 		CooldownSeconds int     `json:"cooldown_seconds"`
 		UpstreamBaseURL *string `json:"upstream_base_url"`
 		GatewayPort     *string `json:"gateway_port"`
+		GatewaySticky   *bool   `json:"gateway_sticky"`
 		EofThreshold    int     `json:"eof_threshold"`
+
+		// 被动体检配置（int 传 >0 才生效，float 传 >0 且 <=1 才生效）
+		PassiveEarlyLifetimeSec   int     `json:"passive_early_lifetime_sec"`
+		PassiveEarlyBytes         int     `json:"passive_early_bytes"`
+		PassiveSuccessBytes       int     `json:"passive_success_bytes"`
+		PassiveSuccessLifetimeSec int     `json:"passive_success_lifetime_sec"`
+		PassiveConsecThreshold    int     `json:"passive_consec_threshold"`
+		PassiveEjectBaseSec       int     `json:"passive_eject_base_sec"`
+		PassiveEjectCapSec        int     `json:"passive_eject_cap_sec"`
+		PassiveMaxEjectPercent    float64 `json:"passive_max_eject_percent"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -506,8 +569,35 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 		}
 		newCfg.GatewayPort = port
 	}
+	if req.GatewaySticky != nil {
+		newCfg.GatewaySticky = *req.GatewaySticky
+	}
 	if req.EofThreshold > 0 {
 		newCfg.EofThreshold = req.EofThreshold
+	}
+	if req.PassiveEarlyLifetimeSec > 0 {
+		newCfg.PassiveEarlyLifetimeSec = req.PassiveEarlyLifetimeSec
+	}
+	if req.PassiveEarlyBytes > 0 {
+		newCfg.PassiveEarlyBytes = req.PassiveEarlyBytes
+	}
+	if req.PassiveSuccessBytes > 0 {
+		newCfg.PassiveSuccessBytes = req.PassiveSuccessBytes
+	}
+	if req.PassiveSuccessLifetimeSec > 0 {
+		newCfg.PassiveSuccessLifetimeSec = req.PassiveSuccessLifetimeSec
+	}
+	if req.PassiveConsecThreshold > 0 {
+		newCfg.PassiveConsecThreshold = req.PassiveConsecThreshold
+	}
+	if req.PassiveEjectBaseSec > 0 {
+		newCfg.PassiveEjectBaseSec = req.PassiveEjectBaseSec
+	}
+	if req.PassiveEjectCapSec > 0 {
+		newCfg.PassiveEjectCapSec = req.PassiveEjectCapSec
+	}
+	if req.PassiveMaxEjectPercent > 0 && req.PassiveMaxEjectPercent <= 1 {
+		newCfg.PassiveMaxEjectPercent = req.PassiveMaxEjectPercent
 	}
 
 	if err := config.Save(&newCfg); err != nil {

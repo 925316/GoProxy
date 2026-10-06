@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -167,13 +168,19 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 	var client *http.Client
 	var err error
 
-	switch p.Protocol {
+	// Normalize protocol: lowercase compare, https shares http validation path
+	normalized := strings.ToLower(strings.TrimSpace(p.Protocol))
+	if normalized == "https" {
+		normalized = "http"
+	}
+
+	switch normalized {
 	case "http":
 		client, err = newHTTPClient(p.Address, v.timeout)
 	case "socks5":
 		client, err = newSOCKS5Client(p.Address, v.timeout)
 	default:
-		log.Printf("unknown protocol %s for %s", p.Protocol, p.Address)
+		log.Printf("[validator] unknown protocol %s (normalized %s) for %s", p.Protocol, normalized, p.Address)
 		return false, 0, "", ""
 	}
 
@@ -233,8 +240,8 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 		}
 	}
 
-	// HTTP 代理额外检测：必须支持 HTTPS CONNECT 隧道
-	if p.Protocol == "http" {
+	// HTTP 代理额外检测：必须支持 HTTPS CONNECT 隧道 (https nodes share this path)
+	if normalized == "http" {
 		if !checkHTTPSConnect(p.Address, v.timeout) {
 			return false, latency, exitIP, exitLocation
 		}

@@ -249,15 +249,13 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 		conn, err := s.dialViaProxy(p, r.Host)
 		if err != nil {
-			log.Printf("[tunnel] dial %s via %s failed, removing", r.Host, p.Address)
+			log.Printf("[tunnel] dial %s via %s failed: %v, removing", r.Host, p.Address, err)
 			s.storage.RecordProxyUse(p.Address, false)
 			removeOrDisableProxy(s.storage, p)
 			continue
 		}
 
-		s.storage.RecordProxyUse(p.Address, true)
-
-		// 告知客户端隧道建立
+		// 告知客户端隧道建立（此时不记成功：尸体判定在隧道关闭时做）
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
 			conn.Close()
@@ -273,9 +271,9 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 		log.Printf("[tunnel] %s via %s established", r.Host, p.Address)
 
-		// 双向转发
-		go transfer(conn, clientConn)
-		go transfer(clientConn, conn)
+		// 被动体检：双向转发 + 尸体上报（字节/时长/关闭方/关闭类型），关时再判
+		upBytes, downBytes, lifetime, closer, closeType := relayTunnel(conn, clientConn)
+		GetScorer().ReportTunnel(p.Address, lifetime, upBytes, downBytes, closer, closeType, s.storage, s.cfg)
 		return
 	}
 
@@ -338,10 +336,4 @@ func (s *Server) buildClient(p *storage.Proxy) (*http.Client, error) {
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", p.Protocol)
 	}
-}
-
-func transfer(dst io.WriteCloser, src io.ReadCloser) {
-	defer dst.Close()
-	defer src.Close()
-	io.Copy(dst, src)
 }

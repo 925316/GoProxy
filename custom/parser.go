@@ -30,7 +30,7 @@ func (n *ParsedNode) NodeKey() string {
 
 // IsDirect 是否可以直接作为代理使用（不需要 sing-box 转换）
 func (n *ParsedNode) IsDirect() bool {
-	return n.Type == "http" || n.Type == "socks5"
+	return n.Type == "http" || n.Type == "https" || n.Type == "socks5"
 }
 
 // DirectAddress 返回直接代理的地址
@@ -311,12 +311,14 @@ func parseClashProxy(proxy map[string]interface{}) (*ParsedNode, error) {
 	}
 
 	// 标准化类型名
-	typ = strings.ToLower(typ)
+	typ = strings.ToLower(strings.TrimSpace(typ))
 	switch typ {
 	case "ss":
 		typ = "shadowsocks"
 	case "ssr":
 		typ = "shadowsocksr"
+	case "https":
+		typ = "http"
 	}
 
 	// 支持的类型

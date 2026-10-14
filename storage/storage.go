@@ -799,16 +799,12 @@ func (s *Storage) GetQualityDistribution() (map[string]int, error) {
 }
 
 // GetBatchForHealthCheck 获取一批需要健康检查的代理（排除冷却中的）
-func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool) ([]Proxy, error) {
+// fail_count DESC 插队，带前科的优先复查；S 级不再豁免
+func (s *Storage) GetBatchForHealthCheck(batchSize int) ([]Proxy, error) {
 	query := `SELECT ` + proxyColumns + `
 		 FROM proxies
 		 WHERE status IN ('active', 'degraded') AND fail_count < 3
 		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)`
-
-	if skipSGrade {
-		// S 级豁免不保 fail_count>0 的节点（假低延迟的劫持节点不能靠 S 级躲体检）
-		query += ` AND (quality_grade != 'S' OR fail_count > 0)`
-	}
 
 	query += ` ORDER BY
 		fail_count DESC,

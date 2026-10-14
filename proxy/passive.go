@@ -218,6 +218,9 @@ func (ps *PassiveScorer) ReportTunnel(address, target string, lifetime time.Dura
 
 	// stall：客户端发过数据、上游零下行、存活超过下限
 	stalled := upBytes > 0 && downBytes == 0 && lifetime >= stallFloor
+	// 上游先关且零下行字节 = 请求彻底无响应，无论存活多久都不算成功
+	//（5~10s 才死的节点会落在 early/stall 夹缝里被旧逻辑记成功）
+	noResponse := upBytes > 0 && downBytes == 0 && closerSide == "upstream"
 
 	flaky, flakyStallN, flakySeenN := false, 0, 0
 	if target != "" {
@@ -263,8 +266,9 @@ func (ps *PassiveScorer) ReportTunnel(address, target string, lifetime time.Dura
 		}
 	}
 
-	// Upstream closed first: only short+small (or stalled) counts as demerit.
-	if closerSide != "client" && !(lifetime < earlyLifetime && total < earlyBytes) && !stalled {
+	// Upstream closed first: only short+small counts as success; no-response
+	// and stalled corpses both demerit regardless of lifetime.
+	if closerSide != "client" && !(lifetime < earlyLifetime && total < earlyBytes) && !stalled && !noResponse {
 		ps.reset(address)
 		_ = store.RecordProxyUse(address, true)
 		return
@@ -285,6 +289,9 @@ func (ps *PassiveScorer) ReportTunnel(address, target string, lifetime time.Dura
 	if stalled {
 		log.Printf("[passive] %s stall corpse target=%s life=%v up=%d down=%d closer=%s type=%s consec=%d/%d",
 			address, target, lifetime.Round(time.Millisecond), upBytes, downBytes, closerSide, closeType, consec, threshold)
+	} else if noResponse {
+		log.Printf("[passive] %s no-response corpse target=%s life=%v up=%d closer=%s type=%s consec=%d/%d",
+			address, target, lifetime.Round(time.Millisecond), upBytes, closerSide, closeType, consec, threshold)
 	} else if closeType == "RST" {
 		log.Printf("[passive] %s upstream-RST corpse target=%s life=%v bytes=%d consec=%d/%d",
 			address, target, lifetime.Round(time.Millisecond), total, consec, threshold)

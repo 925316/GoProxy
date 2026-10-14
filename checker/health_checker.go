@@ -32,24 +32,9 @@ func (hc *HealthChecker) RunOnce() {
 	start := time.Now()
 	log.Println("[health] 开始健康检查...")
 
-	// 获取池子状态
-	status, err := hc.poolMgr.GetStatus()
-	if err != nil {
-		log.Printf("[health] 获取状态失败: %v", err)
-		return
-	}
-
-	// 健康状态且S级占比高时，跳过S级代理检查
-	skipSGrade := status.State == "healthy"
-	dist, _ := hc.storage.GetQualityDistribution()
-	sGradeCount := dist["S"]
-	totalCount := status.Total
-	if totalCount > 0 && float64(sGradeCount)/float64(totalCount) > 0.3 {
-		skipSGrade = true
-	}
-
-	// 批量获取需要检查的代理
-	proxies, err := hc.storage.GetBatchForHealthCheck(hc.cfg.HealthCheckBatchSize, skipSGrade)
+	// 全量体检：S 级不再豁免——注入节点靠假低延迟拿 S 级后终身免检，
+	// 证书检查才是判 S 的真标准
+	proxies, err := hc.storage.GetBatchForHealthCheck(hc.cfg.HealthCheckBatchSize)
 	if err != nil {
 		log.Printf("[health] 获取检查批次失败: %v", err)
 		return
@@ -60,7 +45,7 @@ func (hc *HealthChecker) RunOnce() {
 		return
 	}
 
-	log.Printf("[health] 检查 %d 个代理（跳过S级=%v）", len(proxies), skipSGrade)
+	log.Printf("[health] 检查 %d 个代理", len(proxies))
 
 	// 执行验证
 	validCount := 0

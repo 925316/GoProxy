@@ -93,6 +93,10 @@ var httpsTestTargets = []string{
 	"https://httpbin.org/ip",
 }
 
+// httpsCanaryTarget 用户实际流量域名：注入节点只对特定 SNI 换证书，
+// 通用目标测不出来，canary 必须过真实证书链
+const httpsCanaryTarget = "https://opencode.ai"
+
 // checkHTTPSConnect 通过 HTTP 代理实际访问一个随机 HTTPS 网站，验证 CONNECT 隧道是否可用
 // 首次失败会换一个目标重试一次，避免目标网站偶尔抽风导致误杀
 func checkHTTPSConnect(proxyAddr string, timeout time.Duration) bool {
@@ -130,10 +134,30 @@ func checkHTTPSConnectSOCKS5(proxyAddr string, timeout time.Duration) bool {
 	return probeHTTPSGet(client)
 }
 
-// probeHTTPSGet GET 随机 HTTPS 目标；拿到任意 HTTP 响应即通过
-//（4xx/5xx 是源站拒绝不是代理坏），仅传输层/TLS 错误算失败，换目标重试一次
+// probeHTTPSGet GET canary 目标验证证书链；证书类错误 = 中间人注入，直接判负不回退；
+// 仅传输层不可达时退回通用目标，避免 canary 路由问题误杀
 func probeHTTPSGet(client *http.Client) bool {
 	defer client.CloseIdleConnections()
+	resp, err := client.Get(httpsCanaryTarget)
+	if err == nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return true
+	}
+	if isTLSError(err) {
+		return false
+	}
+	return probeGenericHTTPS(client)
+}
+
+// isTLSError 证书/TLS 层错误（x509 校验失败等），而非网络不可达
+func isTLSError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "x509:") || strings.Contains(msg, "tls:")
+}
+
+// probeGenericHTTPS 随机通用目标重试一次，拿到任意 HTTP 响应即通过
+func probeGenericHTTPS(client *http.Client) bool {
 	// 随机起始索引
 	start := int(time.Now().UnixNano() % int64(len(httpsTestTargets)))
 

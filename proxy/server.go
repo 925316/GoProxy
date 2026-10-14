@@ -206,12 +206,12 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// 429：上游按出口 IP 限流，冷却该节点并换下一个重试（不删除、不加 fail_count）
+		// 429：上游按出口 IP 限流，冷却该节点并换下一个重试（只记使用，不加 fail_count）
 		if resp.StatusCode == http.StatusTooManyRequests {
 			cd := retryAfterOr(resp.Header.Get("Retry-After"), time.Duration(s.cfg.CooldownSeconds)*time.Second)
 			log.Printf("[proxy] ⚠️  429 %s via %s -> 冷却 %s，换节点重试", r.RequestURI, p.Address, cd)
 			resp.Body.Close()
-			s.storage.RecordProxyUse(p.Address, false)
+			s.storage.RecordProxyUseNoFail(p.Address)
 			s.storage.SetCooldown(p.Address, cd)
 			continue
 		}
@@ -225,7 +225,13 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
 		resp.Body.Close()
-		s.storage.RecordProxyUse(p.Address, true)
+		// 5xx 记失败：免费 MITM 节点咽掉上游错误返 500/502 时，
+		// 旧逻辑照记成功，use/success 永远全绿、永远清不掉
+		if resp.StatusCode >= 500 {
+			s.storage.RecordProxyUse(p.Address, false)
+		} else {
+			s.storage.RecordProxyUse(p.Address, true)
+		}
 		if resp.StatusCode >= 400 {
 			log.Printf("[proxy] %s via %s -> %d", r.RequestURI, p.Address, resp.StatusCode)
 		}
@@ -273,7 +279,7 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 		// 被动体检：双向转发 + 尸体上报（字节/时长/关闭方/关闭类型），关时再判
 		upBytes, downBytes, lifetime, closer, closeType := relayTunnel(conn, clientConn)
-		GetScorer().ReportTunnel(p.Address, lifetime, upBytes, downBytes, closer, closeType, s.storage, s.cfg)
+		GetScorer().ReportTunnel(p.Address, r.Host, lifetime, upBytes, downBytes, closer, closeType, s.storage, s.cfg)
 		return
 	}
 
@@ -291,6 +297,8 @@ func (s *Server) dialViaProxy(p *storage.Proxy, host string) (net.Conn, error) {
 		// 发送 CONNECT 请求给上游 HTTP 代理
 		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host)
 		buf := make([]byte, 256)
+		// 读 CONNECT 响应也要 deadline，防止哑节点挂住 goroutine
+		_ = conn.SetDeadline(time.Now().Add(timeout))
 		n, err := conn.Read(buf)
 		if err != nil {
 			conn.Close()
@@ -300,6 +308,7 @@ func (s *Server) dialViaProxy(p *storage.Proxy, host string) (net.Conn, error) {
 			conn.Close()
 			return nil, fmt.Errorf("short response from proxy")
 		}
+		_ = conn.SetDeadline(time.Time{})
 		return conn, nil
 	case "socks5":
 		dialer, err := proxy.SOCKS5("tcp", p.Address, nil, proxy.Direct)

@@ -503,7 +503,9 @@ func (s *Storage) GetLowestLatencyExclude(excludes []string) (*Proxy, error) {
 	return s.GetLowestLatencyExcludeFiltered(excludes, "")
 }
 
-// GetLowestLatencyExcludeFiltered 排除指定地址后获取延迟最低的代理（可按来源过滤）
+// GetLowestLatencyExcludeFiltered 排除指定地址后获取延迟最低的代理（可按来源过滤）。
+// 最快档内随机取一个：确定性返回同一个"当前最快"会把流量磁吸到单节点，
+// 免费池延迟又不刷新，结果是 548 次请求全打同一个 MITM 节点。
 func (s *Storage) GetLowestLatencyExcludeFiltered(excludes []string, sourceFilter string) (*Proxy, error) {
 	proxies, err := s.GetAllFiltered(sourceFilter)
 	if err != nil {
@@ -515,14 +517,31 @@ func (s *Storage) GetLowestLatencyExcludeFiltered(excludes []string, sourceFilte
 		excludeMap[e] = true
 	}
 
+	var available []Proxy
 	for _, p := range proxies {
 		if !excludeMap[p.Address] {
-			proxy := p
-			return &proxy, nil
+			available = append(available, p)
 		}
 	}
 
-	return nil, fmt.Errorf("no available proxy")
+	return pickLowestLatency(available)
+}
+
+// latencyTiebreakBandMs 随机带：与最快节点相差此值以内算同档，档内随机
+const latencyTiebreakBandMs = 200
+
+// pickLowestLatency 从已按 latency ASC 排序的候选里取最快档内的随机一个
+func pickLowestLatency(available []Proxy) (*Proxy, error) {
+	if len(available) == 0 {
+		return nil, fmt.Errorf("no available proxy")
+	}
+	band := available[0].Latency + latencyTiebreakBandMs
+	n := 0
+	for n < len(available) && available[n].Latency <= band {
+		n++
+	}
+	pick := available[rand.Intn(n)]
+	return &pick, nil
 }
 
 // GetRandomByProtocolExclude 按协议获取随机代理（排除已尝试的）
@@ -562,7 +581,7 @@ func (s *Storage) GetLowestLatencyByProtocolExclude(protocol string, excludes []
 	return s.GetLowestLatencyByProtocolExcludeFiltered(protocol, excludes, "")
 }
 
-// GetLowestLatencyByProtocolExcludeFiltered 按协议获取最低延迟代理（可按来源过滤）
+// GetLowestLatencyByProtocolExcludeFiltered 按协议获取最低延迟代理（排除已尝试的），最快档内随机
 func (s *Storage) GetLowestLatencyByProtocolExcludeFiltered(protocol string, excludes []string, sourceFilter string) (*Proxy, error) {
 	proxies, err := s.GetAllFiltered(sourceFilter)
 	if err != nil {
@@ -574,14 +593,14 @@ func (s *Storage) GetLowestLatencyByProtocolExcludeFiltered(protocol string, exc
 		excludeMap[e] = true
 	}
 
+	var available []Proxy
 	for _, p := range proxies {
 		if p.Protocol == protocol && !excludeMap[p.Address] {
-			proxy := p
-			return &proxy, nil
+			available = append(available, p)
 		}
 	}
 
-	return nil, fmt.Errorf("no %s proxy available", protocol)
+	return pickLowestLatency(available)
 }
 
 // Delete 立即删除指定代理
@@ -639,6 +658,26 @@ func (s *Storage) RecordProxyUse(address string, success bool) error {
 	}
 	_, err := s.db.Exec(
 		`UPDATE proxies SET use_count = use_count + 1, fail_count = fail_count + 1, 
+		 last_used = CURRENT_TIMESTAMP WHERE address = ?`,
+		address,
+	)
+	return err
+}
+
+// PenalizeLatency 运行期失败反馈：抬高 latency 让节点在最低延迟选路里下沉。
+// 验证通过时 UpdateExitInfo 会写回真实值实现自愈；否则该节点本来就该沉底或被删。
+func (s *Storage) PenalizeLatency(address string, penaltyMs int) error {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET latency = latency + ? WHERE address = ?`,
+		penaltyMs, address,
+	)
+	return err
+}
+
+// RecordProxyUseNoFail 记录一次使用，不计 fail_count（429 等非节点过错的场景）
+func (s *Storage) RecordProxyUseNoFail(address string) error {
+	_, err := s.db.Exec(
+		`UPDATE proxies SET use_count = use_count + 1,
 		 last_used = CURRENT_TIMESTAMP WHERE address = ?`,
 		address,
 	)
@@ -767,10 +806,12 @@ func (s *Storage) GetBatchForHealthCheck(batchSize int, skipSGrade bool) ([]Prox
 		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)`
 
 	if skipSGrade {
-		query += ` AND quality_grade != 'S'`
+		// S 级豁免不保 fail_count>0 的节点（假低延迟的劫持节点不能靠 S 级躲体检）
+		query += ` AND (quality_grade != 'S' OR fail_count > 0)`
 	}
 
-	query += ` ORDER BY 
+	query += ` ORDER BY
+		fail_count DESC,
 		COALESCE(last_check, '1970-01-01') ASC,
 		quality_grade DESC
 		LIMIT ?`
@@ -809,6 +850,22 @@ func CalculateQualityGrade(latencyMs int) string {
 // DeleteInvalid 删除失败次数超过阈值的代理（仅免费代理）
 func (s *Storage) DeleteInvalid(maxFailCount int) (int64, error) {
 	res, err := s.db.Exec(`DELETE FROM proxies WHERE fail_count >= ? AND source = 'free'`, maxFailCount)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// DisableInvalidCustom 把 fail_count 达标的订阅节点置 disabled，
+// 交给探测唤醒闭环（EnableProxy 会清零 fail_count 让其有恢复机会）。
+// 没有这一步，fail_count>=3 且 status=active 的订阅节点会卡在
+// "体检批次不要（fail_count<3 过滤）、选路不要、唤醒不捞"的三不管状态。
+func (s *Storage) DisableInvalidCustom(maxFailCount int) (int64, error) {
+	res, err := s.db.Exec(
+		`UPDATE proxies SET status = 'disabled'
+		 WHERE fail_count >= ? AND source = 'custom' AND status != 'disabled'`,
+		maxFailCount,
+	)
 	if err != nil {
 		return 0, err
 	}

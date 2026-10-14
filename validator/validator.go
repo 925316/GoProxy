@@ -109,6 +109,31 @@ func checkHTTPSConnect(proxyAddr string, timeout time.Duration) bool {
 		Timeout: timeout,
 	}
 
+	return probeHTTPSGet(client)
+}
+
+// checkHTTPSConnectSOCKS5 同 checkHTTPSConnect，经 SOCKS5 拨号（证书走 Go 默认校验）
+func checkHTTPSConnectSOCKS5(proxyAddr string, timeout time.Duration) bool {
+	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
+	if err != nil {
+		return false
+	}
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Dial:                 dialer.Dial,
+			TLSHandshakeTimeout:  timeout,
+		},
+		Timeout: timeout,
+	}
+
+	return probeHTTPSGet(client)
+}
+
+// probeHTTPSGet GET 随机 HTTPS 目标；拿到任意 HTTP 响应即通过
+//（4xx/5xx 是源站拒绝不是代理坏），仅传输层/TLS 错误算失败，换目标重试一次
+func probeHTTPSGet(client *http.Client) bool {
+	defer client.CloseIdleConnections()
 	// 随机起始索引
 	start := int(time.Now().UnixNano() % int64(len(httpsTestTargets)))
 
@@ -120,11 +145,7 @@ func checkHTTPSConnect(proxyAddr string, timeout time.Duration) bool {
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-
-		// 2xx 或 3xx 都算成功（部分网站会重定向）
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			return true
-		}
+		return true
 	}
 
 	return false
@@ -187,6 +208,7 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 	if err != nil {
 		return false, 0, "", ""
 	}
+	defer client.CloseIdleConnections()
 
 	start := time.Now()
 	resp, err := client.Get(v.validateURL)
@@ -243,6 +265,12 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 	// HTTP 代理额外检测：必须支持 HTTPS CONNECT 隧道 (https nodes share this path)
 	if normalized == "http" {
 		if !checkHTTPSConnect(p.Address, v.timeout) {
+			return false, latency, exitIP, exitLocation
+		}
+	}
+	// SOCKS5 同样过 HTTPS 隧道与证书校验
+	if normalized == "socks5" {
+		if !checkHTTPSConnectSOCKS5(p.Address, v.timeout) {
 			return false, latency, exitIP, exitLocation
 		}
 	}

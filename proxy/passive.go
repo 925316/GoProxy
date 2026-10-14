@@ -23,12 +23,32 @@ type nodeStat struct {
 	lastSeen    time.Time // for map expiry
 }
 
+// targetStat aggregates stalls per destination so a site-wide packet drop
+// (blocked domain) is not blamed on whichever upstreams happened to carry it.
+type targetStat struct {
+	nodes      map[string]bool // distinct upstreams seen on this target
+	stallNodes map[string]bool // distinct upstreams that stalled on this target
+	stalls     int
+	lastSeen   time.Time
+}
+
+// 站点级丢包判定：多个不同节点在同一目标集体 stall 才豁免节点。
+// 单个节点主导流量时（nodes 少）不会触发豁免，照罚。
+const (
+	targetFlakyMinStallNodes = 2
+	targetFlakyMinNodes      = 3
+	stallGrace               = 250 * time.Millisecond
+	// demeritLatencyPenaltyMs 每次 demerit 抬高的延迟，让坏节点在最低延迟选路里下沉
+	demeritLatencyPenaltyMs = 1000
+)
+
 // PassiveScorer is a process-global passive health scorer.
 // Signals come only from real client traffic corpses: dial results are
 // handled inline, tunnel lifetime/bytes/close-reason arrive via ReportTunnel.
 type PassiveScorer struct {
-	mu    sync.Mutex
-	nodes map[string]*nodeStat
+	mu      sync.Mutex
+	nodes   map[string]*nodeStat
+	targets map[string]*targetStat
 }
 
 var (
@@ -39,7 +59,10 @@ var (
 // GetScorer returns the process-global scorer, creating it on first use.
 func GetScorer() *PassiveScorer {
 	globalScorerOnce.Do(func() {
-		globalScorer = &PassiveScorer{nodes: make(map[string]*nodeStat)}
+		globalScorer = &PassiveScorer{
+			nodes:   make(map[string]*nodeStat),
+			targets: make(map[string]*targetStat),
+		}
 	})
 	return globalScorer
 }
@@ -82,6 +105,21 @@ func classifyClose(err error) string {
 	return "ERR"
 }
 
+// drainGrace 客户端先关后，在短暂宽限期内读走上游真实在途字节，
+// 避免"响应已在路上"被判成上游 stall。
+func drainGrace(conn net.Conn, grace time.Duration) int64 {
+	_ = conn.SetReadDeadline(time.Now().Add(grace))
+	buf := make([]byte, 32*1024)
+	var n int64
+	for {
+		r, err := conn.Read(buf)
+		n += int64(r)
+		if err != nil {
+			return n
+		}
+	}
+}
+
 // relayTunnel forwards bytes in both directions and reports corpse stats.
 // It returns upBytes (client->upstream), downBytes (upstream->client),
 // lifetime, closerSide ("upstream" or "client"), and closeType
@@ -105,20 +143,27 @@ func relayTunnel(upstream, client net.Conn) (upBytes, downBytes int64, lifetime 
 	}()
 
 	first := <-ch
-	// Unblock the other direction: closing both conns forces the peer copy out.
-	_ = upstream.Close()
-	_ = client.Close()
-	second := <-ch
-
 	lifetime = time.Since(start)
 	if first.from == "c2u" {
+		// 客户端先关：关客户端解套 c2u，再宽限读上游在途字节
+		_ = client.Close()
+		trailing := drainGrace(upstream, stallGrace)
+		_ = upstream.Close()
 		upBytes = first.n
-		downBytes = second.n
+		downBytes = trailing
 		closerSide = "client"
 	} else {
+		_ = upstream.Close()
+		_ = client.Close()
 		downBytes = first.n
-		upBytes = second.n
 		closerSide = "upstream"
+	}
+	second := <-ch
+	if second.n > 0 && second.from == "c2u" && second.n > upBytes {
+		upBytes = second.n
+	}
+	if second.n > 0 && second.from == "u2c" && second.n > downBytes {
+		downBytes = second.n
 	}
 	closeType = classifyClose(first.err)
 	return upBytes, downBytes, lifetime, closerSide, closeType
@@ -128,8 +173,11 @@ func relayTunnel(upstream, client net.Conn) (upBytes, downBytes int64, lifetime 
 // Success paths reset consecutive counters. Early-close (short life + small
 // bytes + upstream-first close) increments demerit; reaching the consecutive
 // threshold ejects the node via SetCooldown with exponential backoff.
-// Client-first closes only bump the abort counter and never penalize upstream.
-func (ps *PassiveScorer) ReportTunnel(address string, lifetime time.Duration, upBytes, downBytes int64, closerSide, closeType string, store *storage.Storage, cfg *config.Config) {
+// Client-first closes only bump the abort counter and never penalize upstream,
+// except a stalled corpse: client sent data, upstream never delivered a byte.
+// Stalls are cross-checked per target: when many distinct upstreams stall on
+// the same destination the destination is dropping packets, not the nodes.
+func (ps *PassiveScorer) ReportTunnel(address, target string, lifetime time.Duration, upBytes, downBytes int64, closerSide, closeType string, store *storage.Storage, cfg *config.Config) {
 	total := upBytes + downBytes
 
 	earlyLifetime := time.Duration(cfg.PassiveEarlyLifetimeSec) * time.Second
@@ -152,6 +200,14 @@ func (ps *PassiveScorer) ReportTunnel(address string, lifetime time.Duration, up
 	if threshold <= 0 {
 		threshold = 3
 	}
+	// stall 生效区间是 [stallFloor, successLifetime)，配到大于等于 successLifetime 等于关闭
+	stallFloor := time.Duration(cfg.PassiveStallFloorSec) * time.Second
+	if stallFloor <= 0 {
+		stallFloor = 10 * time.Second
+	}
+	if stallFloor >= successLifetime {
+		stallFloor = successLifetime
+	}
 
 	// Long or fat tunnels are always success (SSE / chat lifeline).
 	if total >= successBytes || lifetime >= successLifetime {
@@ -160,25 +216,61 @@ func (ps *PassiveScorer) ReportTunnel(address string, lifetime time.Duration, up
 		return
 	}
 
-	// Client hung up first: track only, never punish upstream.
-	if closerSide == "client" {
+	// stall：客户端发过数据、上游零下行、存活超过下限
+	stalled := upBytes > 0 && downBytes == 0 && lifetime >= stallFloor
+
+	flaky, flakyStallN, flakySeenN := false, 0, 0
+	if target != "" {
+		ps.mu.Lock()
+		t := ps.targetStatLocked(target)
+		t.nodes[address] = true
+		t.lastSeen = time.Now()
+		if stalled {
+			t.stalls++
+			t.stallNodes[address] = true
+			if len(t.stallNodes) >= targetFlakyMinStallNodes &&
+				len(t.nodes) >= targetFlakyMinNodes &&
+				len(t.stallNodes)*2 > len(t.nodes) {
+				flaky = true
+				flakyStallN, flakySeenN = len(t.stallNodes), len(t.nodes)
+			}
+		}
+		ps.mu.Unlock()
+	}
+
+	// 目标站点级丢包：不罚任何节点（连坐好节点比漏罚烂节点更糟）
+	if stalled && flaky {
+		log.Printf("[passive] %s stall on %s suppressed: site-wide drop (%d/%d nodes stalled)",
+			address, target, flakyStallN, flakySeenN)
 		ps.mu.Lock()
 		st := ps.statLocked(address)
 		st.clientAbort++
 		st.lastSeen = time.Now()
 		ps.mu.Unlock()
-		_ = store.RecordProxyUse(address, true)
+		_ = store.RecordProxyUseNoFail(address)
 		return
 	}
 
-	// Upstream closed first. Only short+small counts as demerit.
-	if !(lifetime < earlyLifetime && total < earlyBytes) {
+	if closerSide == "client" {
+		if !stalled {
+			ps.mu.Lock()
+			st := ps.statLocked(address)
+			st.clientAbort++
+			st.lastSeen = time.Now()
+			ps.mu.Unlock()
+			_ = store.RecordProxyUse(address, true)
+			return
+		}
+	}
+
+	// Upstream closed first: only short+small (or stalled) counts as demerit.
+	if closerSide != "client" && !(lifetime < earlyLifetime && total < earlyBytes) && !stalled {
 		ps.reset(address)
 		_ = store.RecordProxyUse(address, true)
 		return
 	}
 
-	// Suspicious early close: RST weighs the same single demerit but is logged.
+	// Suspicious early close or stall: same single demerit, log line per kind.
 	ps.mu.Lock()
 	st := ps.statLocked(address)
 	st.consecEarly++
@@ -188,13 +280,17 @@ func (ps *PassiveScorer) ReportTunnel(address string, lifetime time.Duration, up
 	ps.mu.Unlock()
 
 	_ = store.RecordProxyUse(address, false)
+	_ = store.PenalizeLatency(address, demeritLatencyPenaltyMs)
 
-	if closeType == "RST" {
-		log.Printf("[passive] %s upstream-RST corpse life=%v bytes=%d consec=%d/%d",
-			address, lifetime.Round(time.Millisecond), total, consec, threshold)
+	if stalled {
+		log.Printf("[passive] %s stall corpse target=%s life=%v up=%d down=%d closer=%s type=%s consec=%d/%d",
+			address, target, lifetime.Round(time.Millisecond), upBytes, downBytes, closerSide, closeType, consec, threshold)
+	} else if closeType == "RST" {
+		log.Printf("[passive] %s upstream-RST corpse target=%s life=%v bytes=%d consec=%d/%d",
+			address, target, lifetime.Round(time.Millisecond), total, consec, threshold)
 	} else {
-		log.Printf("[passive] %s early-close corpse life=%v bytes=%d closer=%s type=%s consec=%d/%d",
-			address, lifetime.Round(time.Millisecond), total, closerSide, closeType, consec, threshold)
+		log.Printf("[passive] %s early-close corpse target=%s life=%v bytes=%d closer=%s type=%s consec=%d/%d",
+			address, target, lifetime.Round(time.Millisecond), total, closerSide, closeType, consec, threshold)
 	}
 
 	if consec < threshold {
@@ -221,6 +317,15 @@ func (ps *PassiveScorer) statLocked(address string) *nodeStat {
 	if !ok {
 		st = &nodeStat{}
 		ps.nodes[address] = st
+	}
+	return st
+}
+
+func (ps *PassiveScorer) targetStatLocked(target string) *targetStat {
+	st, ok := ps.targets[target]
+	if !ok {
+		st = &targetStat{nodes: map[string]bool{}, stallNodes: map[string]bool{}}
+		ps.targets[target] = st
 	}
 	return st
 }
@@ -272,17 +377,22 @@ func (ps *PassiveScorer) eject(address string, ejects int, store *storage.Storag
 	ps.mu.Unlock()
 }
 
-// expire drops stale entries so the map stays bounded.
+// expire drops stale entries so the maps stay bounded.
 func (ps *PassiveScorer) expire() {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	if len(ps.nodes) < 5000 {
+	if len(ps.nodes) < 5000 && len(ps.targets) < 2000 {
 		return
 	}
 	cutoff := time.Now().Add(-30 * time.Minute)
 	for addr, st := range ps.nodes {
 		if st.lastSeen.Before(cutoff) {
 			delete(ps.nodes, addr)
+		}
+	}
+	for host, t := range ps.targets {
+		if t.lastSeen.Before(cutoff) {
+			delete(ps.targets, host)
 		}
 	}
 }

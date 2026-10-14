@@ -67,6 +67,11 @@ func (hc *HealthChecker) RunOnce() {
 	removeCount := 0
 	updateCount := 0
 
+	maxFail := hc.cfg.MaxFailCount
+	if maxFail <= 0 {
+		maxFail = 3
+	}
+
 	for result := range hc.validator.ValidateStream(proxies) {
 		if result.Valid {
 			validCount++
@@ -75,11 +80,15 @@ func (hc *HealthChecker) RunOnce() {
 			if err := hc.storage.UpdateExitInfo(result.Proxy.Address, result.ExitIP, result.ExitLocation, latencyMs); err == nil {
 				updateCount++
 			}
+			// 通过即清零，fail_count 只增不减会把偶发失败的节点攒死
+			if err := hc.storage.ResetFail(result.Proxy.Address); err != nil {
+				log.Printf("[health] reset fail count error: %v", err)
+			}
 		} else {
 			// 失败次数+1
 			hc.storage.IncrementFailCount(result.Proxy.Address)
-			// 如果失败次数 >= 3
-			if result.Proxy.FailCount+1 >= 3 {
+			// 如果失败次数 >= 阈值
+			if result.Proxy.FailCount+1 >= maxFail {
 				if result.Proxy.Source == "custom" {
 					// 订阅代理：禁用而非删除
 					hc.storage.DisableProxy(result.Proxy.Address)
@@ -89,6 +98,15 @@ func (hc *HealthChecker) RunOnce() {
 				removeCount++
 			}
 		}
+	}
+
+	// 兜底清理攒满失败的免费节点（被 fail_count < 3 挡在体检批次外的）
+	if purged, err := hc.storage.DeleteInvalid(maxFail); err == nil && purged > 0 {
+		log.Printf("[health] 清理 fail_count>=%d 的免费节点: %d 个", maxFail, purged)
+	}
+	// 兜底把攒满失败的订阅节点置 disabled，交给探测唤醒恢复（H2 闭环）
+	if disabled, err := hc.storage.DisableInvalidCustom(maxFail); err == nil && disabled > 0 {
+		log.Printf("[health] 禁用 fail_count>=%d 的订阅节点: %d 个", maxFail, disabled)
 	}
 
 	elapsed := time.Since(start)

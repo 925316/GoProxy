@@ -114,6 +114,7 @@ type Config struct {
 	PassiveEjectBaseSec      int     // 熔断基础秒数，指数退避起点（默认 30）
 	PassiveEjectCapSec       int     // 熔断退避上限秒数（默认 300）
 	PassiveMaxEjectPercent   float64 // 同时熔断上限占比，panic 保护（默认 0.5）
+	PassiveStallFloorSec     int     // stall 判定：存活超过此秒数且上游一个下行字节都没吐（默认 10）
 
 	// ========== 兼容旧配置 ==========
 	MaxResponseMs int // 已废弃，使用 MaxLatencyMs 替代
@@ -270,6 +271,12 @@ func DefaultConfig() *Config {
 			passiveMaxEjectPercent = v
 		}
 	}
+	passiveStallFloorSec := 10
+	if env := os.Getenv("PASSIVE_STALL_FLOOR_SEC"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveStallFloorSec = v
+		}
+	}
 
 	return &Config{
 		// 基础服务配置
@@ -350,6 +357,7 @@ func DefaultConfig() *Config {
 		PassiveEjectBaseSec:       passiveEjectBaseSec,
 		PassiveEjectCapSec:        passiveEjectCapSec,
 		PassiveMaxEjectPercent:    passiveMaxEjectPercent,
+		PassiveStallFloorSec:      passiveStallFloorSec,
 
 		// 兼容旧配置
 		MaxResponseMs: 5000,
@@ -498,6 +506,9 @@ func Load() *Config {
 			if saved.PassiveMaxEjectPercent > 0 && saved.PassiveMaxEjectPercent <= 1 {
 				cfg.PassiveMaxEjectPercent = saved.PassiveMaxEjectPercent
 			}
+			if saved.PassiveStallFloorSec > 0 {
+				cfg.PassiveStallFloorSec = saved.PassiveStallFloorSec
+			}
 		}
 	}
 	cfgMu.Lock()
@@ -567,6 +578,7 @@ type savedConfig struct {
 	PassiveEjectBaseSec       int     `json:"passive_eject_base_sec,omitempty"`
 	PassiveEjectCapSec        int     `json:"passive_eject_cap_sec,omitempty"`
 	PassiveMaxEjectPercent    float64 `json:"passive_max_eject_percent,omitempty"`
+	PassiveStallFloorSec      int     `json:"passive_stall_floor_sec,omitempty"`
 
 	// 兼容旧配置
 	FetchInterval int `json:"fetch_interval,omitempty"`
@@ -618,6 +630,7 @@ func Save(cfg *Config) error {
 		PassiveEjectBaseSec:       cfg.PassiveEjectBaseSec,
 		PassiveEjectCapSec:        cfg.PassiveEjectCapSec,
 		PassiveMaxEjectPercent:    cfg.PassiveMaxEjectPercent,
+		PassiveStallFloorSec:      cfg.PassiveStallFloorSec,
 		FetchInterval:         cfg.FetchInterval,
 		CheckInterval:         cfg.CheckInterval,
 	}, "", "  ")

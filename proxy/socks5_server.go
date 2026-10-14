@@ -92,9 +92,18 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		// 连接上游代理
 		upstreamConn, err := s.dialViaProxy(p, target)
 		if err != nil {
-			log.Printf("[socks5] dial %s via %s (%s) failed: %v, removing", target, p.Address, p.Protocol, err)
+			log.Printf("[socks5] dial %s via %s (%s) failed: %v", target, p.Address, p.Protocol, err)
 			s.storage.RecordProxyUse(p.Address, false)
-			removeOrDisableProxy(s.storage, p)
+			// 不再一次拨失败就删：客户端重试链路（cli-proxy-api 每请求最多
+			// 4 轮 x 连接内 5 次 dial）会把整个池子一次删干。攒满
+			// fail_count 才退场，死节点有界地死，不再批量蒸发。
+			maxFail := config.Get().MaxFailCount
+			if maxFail <= 0 {
+				maxFail = 3
+			}
+			if p.FailCount+1 >= maxFail {
+				removeOrDisableProxy(s.storage, p)
+			}
 			continue
 		}
 
@@ -108,7 +117,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 
 		// 被动体检：双向转发 + 尸体上报（字节/时长/关闭方/关闭类型），关时再判
 		upBytes, downBytes, lifetime, closer, closeType := relayTunnel(upstreamConn, clientConn)
-		GetScorer().ReportTunnel(p.Address, lifetime, upBytes, downBytes, closer, closeType, s.storage, s.cfg)
+		GetScorer().ReportTunnel(p.Address, target, lifetime, upBytes, downBytes, closer, closeType, s.storage, s.cfg)
 		return
 	}
 
@@ -369,6 +378,9 @@ func (s *SOCKS5Server) dialViaProxy(p *storage.Proxy, target string) (net.Conn, 
 		// 发送 CONNECT 请求
 		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
 		buf := make([]byte, 256)
+		// 握手响应读取同样要有 deadline：只给 dial 设超时的话，
+		// 哑巴节点会让 goroutine 无限期挂住
+		_ = conn.SetDeadline(time.Now().Add(timeout))
 		n, err := conn.Read(buf)
 		if err != nil {
 			conn.Close()
@@ -379,6 +391,7 @@ func (s *SOCKS5Server) dialViaProxy(p *storage.Proxy, target string) (net.Conn, 
 			conn.Close()
 			return nil, fmt.Errorf("upstream proxy connect failed")
 		}
+		_ = conn.SetDeadline(time.Time{})
 		return conn, nil
 		
 	case "socks5":
@@ -389,7 +402,8 @@ func (s *SOCKS5Server) dialViaProxy(p *storage.Proxy, target string) (net.Conn, 
 			return nil, err
 		}
 
-		// SOCKS5 握手（无认证）
+		// SOCKS5 握手（无认证），读取响应同样受 deadline 保护
+		_ = proxyConn.SetDeadline(time.Now().Add(timeout))
 		if _, err := proxyConn.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 			proxyConn.Close()
 			return nil, err
@@ -455,6 +469,8 @@ func (s *SOCKS5Server) dialViaProxy(p *storage.Proxy, target string) (net.Conn, 
 			return nil, fmt.Errorf("socks5 connect failed, code: %d", reply[1])
 		}
 
+		// 握手完成，清掉 deadline 交给 relay 长活
+		_ = proxyConn.SetDeadline(time.Time{})
 		return proxyConn, nil
 
 	default:

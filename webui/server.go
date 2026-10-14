@@ -451,6 +451,7 @@ func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 		"passive_eject_base_sec":       cfg.PassiveEjectBaseSec,
 		"passive_eject_cap_sec":        cfg.PassiveEjectCapSec,
 		"passive_max_eject_percent":    cfg.PassiveMaxEjectPercent,
+		"passive_stall_floor_sec":      cfg.PassiveStallFloorSec,
 	})
 }
 
@@ -498,6 +499,7 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 		PassiveEjectBaseSec       int     `json:"passive_eject_base_sec"`
 		PassiveEjectCapSec        int     `json:"passive_eject_cap_sec"`
 		PassiveMaxEjectPercent    float64 `json:"passive_max_eject_percent"`
+		PassiveStallFloorSec      int     `json:"passive_stall_floor_sec"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -598,6 +600,9 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.PassiveMaxEjectPercent > 0 && req.PassiveMaxEjectPercent <= 1 {
 		newCfg.PassiveMaxEjectPercent = req.PassiveMaxEjectPercent
+	}
+	if req.PassiveStallFloorSec > 0 {
+		newCfg.PassiveStallFloorSec = req.PassiveStallFloorSec
 	}
 
 	if err := config.Save(&newCfg); err != nil {

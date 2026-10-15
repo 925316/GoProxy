@@ -1,0 +1,40 @@
+# Auto-clean old GHCR image versions for ghcr.io/925316/goproxy.
+# Safety model:
+#   - Step 1 trims old sha-* tagged builds, always keeps the 6 newest versions.
+#   - Step 2 sweeps orphaned untagged manifests, keeps the 10 newest untagged
+#     so live children of kept indexes (image + attestation) are never touched.
+#   - latest and branch tags (feat-*) are never deletion candidates.
+# Schedule only activates after this file exists on the default branch.
+
+name: GHCR Cleanup
+
+on:
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old sha-* tagged versions (keep newest 6)
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: goproxy
+          package-type: container
+          token: ${{ secrets.GITHUB_TOKEN }}
+          delete-tag-pattern: '^sha-.*'
+          min-versions-to-keep: 6
+
+      - name: Delete orphaned untagged versions (keep newest 10)
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: goproxy
+          package-type: container
+          token: ${{ secrets.GITHUB_TOKEN }}
+          delete-only-untagged-versions: true
+          min-versions-to-keep: 10

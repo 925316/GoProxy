@@ -18,6 +18,7 @@ import (
 // Only a few dozen bytes per node, no SQLite writes on the hot path.
 type nodeStat struct {
 	consecEarly int       // consecutive early-close demerits
+	consecStall int       // stall/no-response 独立计数，满 2 次直冷
 	ejectCount  int       // times ejected (for exponential backoff)
 	clientAbort int       // client-first closes (not penalized, tracked only)
 	lastSeen    time.Time // for map expiry
@@ -200,6 +201,10 @@ func (ps *PassiveScorer) ReportTunnel(address, target string, lifetime time.Dura
 	if threshold <= 0 {
 		threshold = 3
 	}
+	stallThreshold := cfg.PassiveStallThreshold
+	if stallThreshold <= 0 {
+		stallThreshold = 2
+	}
 	// stall 生效区间是 [stallFloor, successLifetime)，配到大于等于 successLifetime 等于关闭
 	stallFloor := time.Duration(cfg.PassiveStallFloorSec) * time.Second
 	if stallFloor <= 0 {
@@ -241,21 +246,16 @@ func (ps *PassiveScorer) ReportTunnel(address, target string, lifetime time.Dura
 		ps.mu.Unlock()
 	}
 
-	// 目标站点级丢包：不罚任何节点（连坐好节点比漏罚烂节点更糟）
+	// 目标站点级丢包：照罚不误，只打标（集体 stall 曾被用来给黑洞免罚）
 	if stalled && flaky {
-		log.Printf("[passive] %s stall on %s suppressed: site-wide drop (%d/%d nodes stalled)",
+		log.Printf("[passive] %s stall on %s site-wide drop (%d/%d nodes stalled), demerit anyway",
 			address, target, flakyStallN, flakySeenN)
-		ps.mu.Lock()
-		st := ps.statLocked(address)
-		st.clientAbort++
-		st.lastSeen = time.Now()
-		ps.mu.Unlock()
-		_ = store.RecordProxyUseNoFail(address)
-		return
 	}
 
+	// 客户端先关：只有真快退（短+小）才算成功；超 early 线的先关
+	// 说明客户端等太久先挂了，记 NoFail 不洗白
 	if closerSide == "client" {
-		if !stalled {
+		if lifetime < earlyLifetime && total < earlyBytes {
 			ps.mu.Lock()
 			st := ps.statLocked(address)
 			st.clientAbort++
@@ -264,22 +264,37 @@ func (ps *PassiveScorer) ReportTunnel(address, target string, lifetime time.Dura
 			_ = store.RecordProxyUse(address, true)
 			return
 		}
+		if !stalled {
+			ps.mu.Lock()
+			st := ps.statLocked(address)
+			st.clientAbort++
+			st.lastSeen = time.Now()
+			ps.mu.Unlock()
+			_ = store.RecordProxyUseNoFail(address)
+			return
+		}
 	}
 
-	// Upstream closed first: only short+small counts as success; no-response
-	// and stalled corpses both demerit regardless of lifetime.
-	if closerSide != "client" && !(lifetime < earlyLifetime && total < earlyBytes) && !stalled && !noResponse {
+	// Upstream closed first: only short+small counts as success.
+	// Everything else (stall / no-response / fat slow-drip) demerits,
+	// no fallthrough success for drip-feed blackholes.
+	if closerSide != "client" && lifetime < earlyLifetime && total < earlyBytes {
 		ps.reset(address)
 		_ = store.RecordProxyUse(address, true)
 		return
 	}
 
-	// Suspicious early close or stall: same single demerit, log line per kind.
+	// 可疑尸体统一记一笔；stall/no-response 走独立快车道
 	ps.mu.Lock()
 	st := ps.statLocked(address)
-	st.consecEarly++
+	if stalled || noResponse {
+		st.consecStall++
+	} else {
+		st.consecEarly++
+	}
 	st.lastSeen = time.Now()
 	consec := st.consecEarly
+	stallConsec := st.consecStall
 	ejects := st.ejectCount
 	ps.mu.Unlock()
 
@@ -288,16 +303,26 @@ func (ps *PassiveScorer) ReportTunnel(address, target string, lifetime time.Dura
 
 	if stalled {
 		log.Printf("[passive] %s stall corpse target=%s life=%v up=%d down=%d closer=%s type=%s consec=%d/%d",
-			address, target, lifetime.Round(time.Millisecond), upBytes, downBytes, closerSide, closeType, consec, threshold)
+			address, target, lifetime.Round(time.Millisecond), upBytes, downBytes, closerSide, closeType, stallConsec, stallThreshold)
 	} else if noResponse {
 		log.Printf("[passive] %s no-response corpse target=%s life=%v up=%d closer=%s type=%s consec=%d/%d",
-			address, target, lifetime.Round(time.Millisecond), upBytes, closerSide, closeType, consec, threshold)
+			address, target, lifetime.Round(time.Millisecond), upBytes, closerSide, closeType, stallConsec, stallThreshold)
 	} else if closeType == "RST" {
 		log.Printf("[passive] %s upstream-RST corpse target=%s life=%v bytes=%d consec=%d/%d",
 			address, target, lifetime.Round(time.Millisecond), total, consec, threshold)
 	} else {
 		log.Printf("[passive] %s early-close corpse target=%s life=%v bytes=%d closer=%s type=%s consec=%d/%d",
 			address, target, lifetime.Round(time.Millisecond), total, closerSide, closeType, consec, threshold)
+	}
+
+	if stalled || noResponse {
+		if stallConsec < stallThreshold {
+			ps.expire()
+			return
+		}
+		ps.parkStall(address, store, cfg)
+		ps.expire()
+		return
 	}
 
 	if consec < threshold {
@@ -314,6 +339,7 @@ func (ps *PassiveScorer) reset(address string) {
 	ps.mu.Lock()
 	if st, ok := ps.nodes[address]; ok {
 		st.consecEarly = 0
+		st.consecStall = 0
 		st.lastSeen = time.Now()
 	}
 	ps.mu.Unlock()
@@ -335,6 +361,35 @@ func (ps *PassiveScorer) targetStatLocked(target string) *targetStat {
 		ps.targets[target] = st
 	}
 	return st
+}
+
+// parkStall stall/no-response 直冷 300s：黑洞不等指数退避爬坡
+func (ps *PassiveScorer) parkStall(address string, store *storage.Storage, cfg *config.Config) {
+	maxPct := cfg.PassiveMaxEjectPercent
+	if maxPct <= 0 || maxPct > 1 {
+		maxPct = 0.5
+	}
+	if total, err := store.CountAll(); err == nil && total > 0 {
+		if cooling, err := store.GetCooldownProxies(); err == nil {
+			if float64(len(cooling)+1)/float64(total) > maxPct {
+				log.Printf("[passive] %s stall threshold hit but pool %d/%d cooling (cap %.0f%%), skip park",
+					address, len(cooling), total, maxPct*100)
+				return
+			}
+		}
+	}
+	if err := store.SetCooldown(address, 300*time.Second); err != nil {
+		log.Printf("[passive] parkStall %s failed: %v", address, err)
+		return
+	}
+	log.Printf("[passive] park %s -> cooldown 300s (stall x%d)", address, cfg.PassiveStallThreshold)
+
+	ps.mu.Lock()
+	if st, ok := ps.nodes[address]; ok {
+		st.consecStall = 0
+		st.lastSeen = time.Now()
+	}
+	ps.mu.Unlock()
 }
 
 // eject parks the node with exponential backoff (base*2^ejects, capped),

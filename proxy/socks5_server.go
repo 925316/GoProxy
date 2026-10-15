@@ -77,15 +77,26 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 	// 带重试的连接上游代理
 	// 重试机制：只使用 SOCKS5 协议的上游代理（天然支持 HTTPS）
 	tried := []string{}
+	dialCount := map[string]int{}
 	maxRetries := s.cfg.MaxRetry + 2 // 增加重试次数以应对质量差的代理
-	
+	budgetDeadline := time.Now().Add(requestBudget)
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if time.Until(budgetDeadline) < budgetFloor {
+			log.Printf("[socks5] %s 预算耗尽（已试 %d 轮），弃", target, attempt)
+			s.sendSOCKS5Reply(clientConn, 0x01) // General failure
+			return
+		}
 		p, err := s.selectSOCKS5Proxy(tried)
 		if err != nil {
 			log.Printf("[socks5] no available socks5 upstream proxy: %v", err)
 			s.sendSOCKS5Reply(clientConn, 0x01) // General failure
 			return
 		}
+		if dialCount[p.Address] >= 2 {
+			continue
+		}
+		dialCount[p.Address]++
 
 		tried = append(tried, p.Address)
 

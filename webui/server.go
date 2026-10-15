@@ -280,7 +280,7 @@ func (s *Server) apiRefreshProxy(w http.ResponseWriter, r *http.Request) {
 		v := validator.New(1, cfg.ValidateTimeout, cfg.ValidateURL)
 		
 		log.Printf("[webui] refreshing proxy: %s", req.Address)
-		valid, latency, exitIP, exitLocation := v.ValidateOne(*targetProxy)
+		valid, latency, exitIP, exitLocation, _ := v.ValidateOne(*targetProxy, targetProxy.Source == "custom")
 		
 		if valid {
 			latencyMs := int(latency.Milliseconds())
@@ -452,6 +452,7 @@ func (s *Server) apiConfig(w http.ResponseWriter, r *http.Request) {
 		"passive_eject_cap_sec":        cfg.PassiveEjectCapSec,
 		"passive_max_eject_percent":    cfg.PassiveMaxEjectPercent,
 		"passive_stall_floor_sec":      cfg.PassiveStallFloorSec,
+		"passive_stall_threshold":      cfg.PassiveStallThreshold,
 	})
 }
 
@@ -500,6 +501,7 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 		PassiveEjectCapSec        int     `json:"passive_eject_cap_sec"`
 		PassiveMaxEjectPercent    float64 `json:"passive_max_eject_percent"`
 		PassiveStallFloorSec      int     `json:"passive_stall_floor_sec"`
+		PassiveStallThreshold    int     `json:"passive_stall_threshold"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -603,6 +605,9 @@ func (s *Server) apiConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.PassiveStallFloorSec > 0 {
 		newCfg.PassiveStallFloorSec = req.PassiveStallFloorSec
+	}
+	if req.PassiveStallThreshold > 0 {
+		newCfg.PassiveStallThreshold = req.PassiveStallThreshold
 	}
 
 	if err := config.Save(&newCfg); err != nil {

@@ -133,15 +133,31 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var tried []string
+	dialCount := map[string]int{}
+	budgetDeadline := time.Now().Add(requestBudget)
 	for attempt := 0; attempt <= g.cfg.MaxRetry; attempt++ {
+		remaining := time.Until(budgetDeadline)
+		if remaining < budgetFloor {
+			log.Printf("[gateway] %s 预算耗尽（已试 %d 轮），弃", reqPath, attempt)
+			http.Error(w, "proxy budget exhausted", http.StatusGatewayTimeout)
+			return
+		}
+		roundTimeout := firstByteTimeout
+		if remaining < roundTimeout {
+			roundTimeout = remaining
+		}
 		p, err := g.selectProxy(tried)
 		if err != nil {
 			http.Error(w, "no available proxy", http.StatusServiceUnavailable)
 			return
 		}
+		if dialCount[p.Address] >= 2 {
+			continue
+		}
+		dialCount[p.Address]++
 		tried = append(tried, p.Address)
 
-		client, err := g.buildClient(p)
+		client, err := g.buildClient(p, roundTimeout)
 		if err != nil {
 			log.Printf("[gateway] %s via %s 构建客户端失败 -> 冷却换节点: %v", reqPath, p.Address, err)
 			g.abandon(p, cooldown)
@@ -193,7 +209,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request) {
 		var firstErr error
 		select {
 		case firstErr = <-firstCh:
-		case <-time.After(firstByteTimeout):
+		case <-time.After(roundTimeout):
 			firstErr = errors.New("timeout waiting for first byte")
 		}
 		if firstErr != nil {
@@ -219,7 +235,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request) {
 			}()
 			select {
 			case head = <-headCh:
-			case <-time.After(firstByteTimeout):
+			case <-time.After(roundTimeout):
 				log.Printf("[gateway] ⚠️  %s via %s 响应停滞 -> 冷却换节点", reqPath, p.Address)
 				resp.Body.Close()
 				g.abandon(p, cooldown)
@@ -289,6 +305,13 @@ const (
 
 // sniffLimitBytes 响应体嗅探上限
 const sniffLimitBytes = 8 * 1024
+
+// requestBudget 单请求总预算（客户端 25s 超时，23s 内必须见分晓）；
+// budgetFloor 开新一轮所需最少剩余，不够就直接 504 不开工
+const (
+	requestBudget = 23 * time.Second
+	budgetFloor   = 2 * time.Second
+)
 
 // classifyResponseHead 判断 JSON/SSE 头部字节是否携带错误信封。
 // 只认结构化字段（code/status/type），不扫正文，防聊天内容误伤。
@@ -528,11 +551,10 @@ func (g *Gateway) selectProxy(tried []string) (*storage.Proxy, error) {
 	return g.storage.GetLowestLatencyExcludeFiltered(tried, sourceFilter)
 }
 
-// buildClient 构造经节点拨号的 HTTP 客户端。
+// buildClient 构造经节点拨号的 HTTP 客户端，超时按本轮剩余预算截断。
 // 禁止设 http.Client.Timeout（含 body 流式读取总时限，会截断 SSE）；
 // 只限拨号 + 响应头超时。
-func (g *Gateway) buildClient(p *storage.Proxy) (*http.Client, error) {
-	dialTimeout := time.Duration(g.cfg.ValidateTimeout) * time.Second
+func (g *Gateway) buildClient(p *storage.Proxy, dialTimeout time.Duration) (*http.Client, error) {
 	switch p.Protocol {
 	case "http":
 		proxyURL, err := url.Parse("http://" + p.Address)

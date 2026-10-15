@@ -69,11 +69,16 @@ func (hc *HealthChecker) RunOnce() {
 			if err := hc.storage.ResetFail(result.Proxy.Address); err != nil {
 				log.Printf("[health] reset fail count error: %v", err)
 			}
+		} else if result.Proxy.Source == "custom" && result.FailKind != validator.FailKindTLS {
+			// 订阅慢/跨区是常态：非证书失败只抬延迟，不攒 fail_count
+			hc.storage.PenalizeLatency(result.Proxy.Address, 1000)
 		} else {
-			// 失败次数+1
-			hc.storage.IncrementFailCount(result.Proxy.Address)
-			// 如果失败次数 >= 阈值
-			if result.Proxy.FailCount+1 >= maxFail {
+			// 原子 +1 并取回新值判死：体检前快照在高并发下少删
+			failCount, err := hc.storage.IncrementFailCountRet(result.Proxy.Address)
+			if err != nil {
+				continue
+			}
+			if failCount >= maxFail {
 				if result.Proxy.Source == "custom" {
 					// 订阅代理：禁用而非删除
 					hc.storage.DisableProxy(result.Proxy.Address)

@@ -114,7 +114,8 @@ type Config struct {
 	PassiveEjectBaseSec      int     // 熔断基础秒数，指数退避起点（默认 30）
 	PassiveEjectCapSec       int     // 熔断退避上限秒数（默认 300）
 	PassiveMaxEjectPercent   float64 // 同时熔断上限占比，panic 保护（默认 0.5）
-	PassiveStallFloorSec     int     // stall 判定：存活超过此秒数且上游一个下行字节都没吐（默认 10）
+	PassiveStallFloorSec     int     // stall 存活下限秒数（默认 4）
+	PassiveStallThreshold    int     // stall/no-response 独立熔断次数（默认 2）
 
 	// ========== 兼容旧配置 ==========
 	MaxResponseMs int // 已废弃，使用 MaxLatencyMs 替代
@@ -271,10 +272,16 @@ func DefaultConfig() *Config {
 			passiveMaxEjectPercent = v
 		}
 	}
-	passiveStallFloorSec := 10
+	passiveStallFloorSec := 4
 	if env := os.Getenv("PASSIVE_STALL_FLOOR_SEC"); env != "" {
 		if v, err := strconv.Atoi(env); err == nil && v > 0 {
 			passiveStallFloorSec = v
+		}
+	}
+	passiveStallThreshold := 2
+	if env := os.Getenv("PASSIVE_STALL_THRESHOLD"); env != "" {
+		if v, err := strconv.Atoi(env); err == nil && v > 0 {
+			passiveStallThreshold = v
 		}
 	}
 
@@ -358,6 +365,7 @@ func DefaultConfig() *Config {
 		PassiveEjectCapSec:        passiveEjectCapSec,
 		PassiveMaxEjectPercent:    passiveMaxEjectPercent,
 		PassiveStallFloorSec:      passiveStallFloorSec,
+		PassiveStallThreshold:    passiveStallThreshold,
 
 		// 兼容旧配置
 		MaxResponseMs: 5000,
@@ -509,6 +517,9 @@ func Load() *Config {
 			if saved.PassiveStallFloorSec > 0 {
 				cfg.PassiveStallFloorSec = saved.PassiveStallFloorSec
 			}
+			if saved.PassiveStallThreshold > 0 {
+				cfg.PassiveStallThreshold = saved.PassiveStallThreshold
+			}
 		}
 	}
 	cfgMu.Lock()
@@ -579,6 +590,7 @@ type savedConfig struct {
 	PassiveEjectCapSec        int     `json:"passive_eject_cap_sec,omitempty"`
 	PassiveMaxEjectPercent    float64 `json:"passive_max_eject_percent,omitempty"`
 	PassiveStallFloorSec      int     `json:"passive_stall_floor_sec,omitempty"`
+	PassiveStallThreshold    int     `json:"passive_stall_threshold,omitempty"`
 
 	// 兼容旧配置
 	FetchInterval int `json:"fetch_interval,omitempty"`
@@ -631,6 +643,7 @@ func Save(cfg *Config) error {
 		PassiveEjectCapSec:        cfg.PassiveEjectCapSec,
 		PassiveMaxEjectPercent:    cfg.PassiveMaxEjectPercent,
 		PassiveStallFloorSec:      cfg.PassiveStallFloorSec,
+		PassiveStallThreshold:    cfg.PassiveStallThreshold,
 		FetchInterval:         cfg.FetchInterval,
 		CheckInterval:         cfg.CheckInterval,
 	}, "", "  ")

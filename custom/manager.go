@@ -181,7 +181,7 @@ func (m *Manager) probeDisabled() {
 	recovered := 0
 	recoveredSubs := make(map[int64]bool)
 	for _, proxy := range disabled {
-		valid, latency, exitIP, exitLocation := m.validator.ValidateOne(proxy)
+		valid, latency, exitIP, exitLocation, _ := m.validator.ValidateOne(proxy, true)
 		if valid {
 			// 检查地理过滤：恢复前确认不在屏蔽列表中
 			if exitLocation != "" && isGeoBlocked(exitLocation, cfg) {

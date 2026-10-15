@@ -52,7 +52,14 @@ type Result struct {
 	Latency      time.Duration
 	ExitIP       string
 	ExitLocation string
+	FailKind     string // tls=证书/中间人，dial=传输层，http=状态码/延迟/地理
 }
+
+const (
+	FailKindTLS  = "tls"
+	FailKindDial = "dial"
+	FailKindHTTP = "http"
+)
 
 // getExitIPInfo 通过代理获取出口 IP 和地理位置
 func getExitIPInfo(client *http.Client) (string, string) {
@@ -134,17 +141,29 @@ func checkHTTPSConnectSOCKS5(proxyAddr string, timeout time.Duration) bool {
 	return probeHTTPSGet(client)
 }
 
+// canaryMaxLatency 慢 MITM 透传合法证书限速拖时间，超限直接判死
+const canaryMaxLatency = 3 * time.Second
+
 // probeHTTPSGet GET canary 目标验证证书链；证书类错误 = 中间人注入，直接判负不回退；
 // 仅传输层不可达时退回通用目标，避免 canary 路由问题误杀
 func probeHTTPSGet(client *http.Client) bool {
 	defer client.CloseIdleConnections()
+	start := time.Now()
 	resp, err := client.Get(httpsCanaryTarget)
 	if err == nil {
+		if time.Since(start) > canaryMaxLatency {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			return false
+		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return true
 	}
-	if isTLSError(err) {
+	if isTLSError(err) || isHardCut(err) {
+		return false
+	}
+	if !isRetriableDial(err) {
 		return false
 	}
 	return probeGenericHTTPS(client)
@@ -152,8 +171,31 @@ func probeHTTPSGet(client *http.Client) bool {
 
 // isTLSError 证书/TLS 层错误（x509 校验失败等），而非网络不可达
 func isTLSError(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, "x509:") || strings.Contains(msg, "tls:")
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "x509:") ||
+		strings.Contains(msg, "tls:") ||
+		strings.Contains(msg, "certificate") ||
+		strings.Contains(msg, "handshake")
+}
+
+// isHardCut 上游主动截断：RST/EOF/GOAWAY，借通用目标复活不了，直接判死
+func isHardCut(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "reset by peer") ||
+		strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "goaway") ||
+		strings.Contains(msg, "connection reset")
+}
+
+// isRetriableDial 只有拨号层失败才值得换通用目标重试
+func isRetriableDial(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such host") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "deadline") ||
+		strings.Contains(msg, "unreachable") ||
+		strings.Contains(msg, "network is unreachable")
 }
 
 // probeGenericHTTPS 随机通用目标重试一次，拿到任意 HTTP 响应即通过
@@ -197,8 +239,8 @@ func (v *Validator) ValidateStream(proxies []storage.Proxy) <-chan Result {
 			go func(px storage.Proxy) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				valid, latency, exitIP, exitLocation := v.ValidateOne(px)
-				ch <- Result{Proxy: px, Valid: valid, Latency: latency, ExitIP: exitIP, ExitLocation: exitLocation}
+				valid, latency, exitIP, exitLocation, failKind := v.ValidateOne(px, px.Source == "custom")
+				ch <- Result{Proxy: px, Valid: valid, Latency: latency, ExitIP: exitIP, ExitLocation: exitLocation, FailKind: failKind}
 			}(p)
 		}
 		wg.Wait()
@@ -209,7 +251,7 @@ func (v *Validator) ValidateStream(proxies []storage.Proxy) <-chan Result {
 }
 
 // ValidateOne 验证单个代理是否可用，返回是否有效、延迟、出口IP和地理位置
-func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, string) {
+func (v *Validator) ValidateOne(p storage.Proxy, forCustom bool) (bool, time.Duration, string, string, string) {
 	var client *http.Client
 	var err error
 
@@ -226,11 +268,11 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 		client, err = newSOCKS5Client(p.Address, v.timeout)
 	default:
 		log.Printf("[validator] unknown protocol %s (normalized %s) for %s", p.Protocol, normalized, p.Address)
-		return false, 0, "", ""
+		return false, 0, "", "", FailKindDial
 	}
 
 	if err != nil {
-		return false, 0, "", ""
+		return false, 0, "", "", FailKindDial
 	}
 	defer client.CloseIdleConnections()
 
@@ -238,31 +280,31 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 	resp, err := client.Get(v.validateURL)
 	latency := time.Since(start)
 	if err != nil {
-		return false, 0, "", ""
+		return false, 0, "", "", FailKindDial
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 
 	// 验证状态码（200 或 204 都接受）
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return false, latency, "", ""
+		return false, latency, "", "", FailKindHTTP
 	}
 
-	// 响应时间过滤
-	if v.maxResponseMs > 0 && latency > time.Duration(v.maxResponseMs)*time.Millisecond {
-		return false, latency, "", ""
+	// 响应时间过滤（订阅出口慢/跨区是常态，custom 只查证书）
+	if !forCustom && v.maxResponseMs > 0 && latency > time.Duration(v.maxResponseMs)*time.Millisecond {
+		return false, latency, "", "", FailKindHTTP
 	}
 
 	// 获取出口 IP 和地理位置（仅在验证通过时）
 	exitIP, exitLocation := getExitIPInfo(client)
-	
+
 	// 必须能获取到出口信息
 	if exitIP == "" || exitLocation == "" {
-		return false, latency, exitIP, exitLocation
+		return false, latency, exitIP, exitLocation, FailKindHTTP
 	}
-	
-	// 地理过滤：白名单优先，否则走黑名单
-	if v.cfg != nil && len(exitLocation) >= 2 {
+
+	// 地理过滤：白名单优先，否则走黑名单（订阅只查证书，地理不动）
+	if !forCustom && v.cfg != nil && len(exitLocation) >= 2 {
 		countryCode := exitLocation[:2]
 		if len(v.cfg.AllowedCountries) > 0 {
 			// 白名单模式：不在白名单中则拒绝
@@ -274,13 +316,13 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 				}
 			}
 			if !allowed {
-				return false, latency, exitIP, exitLocation
+				return false, latency, exitIP, exitLocation, FailKindHTTP
 			}
 		} else if len(v.cfg.BlockedCountries) > 0 {
 			// 黑名单模式
 			for _, blocked := range v.cfg.BlockedCountries {
 				if countryCode == blocked {
-					return false, latency, exitIP, exitLocation
+					return false, latency, exitIP, exitLocation, FailKindHTTP
 				}
 			}
 		}
@@ -289,17 +331,17 @@ func (v *Validator) ValidateOne(p storage.Proxy) (bool, time.Duration, string, s
 	// HTTP 代理额外检测：必须支持 HTTPS CONNECT 隧道 (https nodes share this path)
 	if normalized == "http" {
 		if !checkHTTPSConnect(p.Address, v.timeout) {
-			return false, latency, exitIP, exitLocation
+			return false, latency, exitIP, exitLocation, FailKindTLS
 		}
 	}
 	// SOCKS5 同样过 HTTPS 隧道与证书校验
 	if normalized == "socks5" {
 		if !checkHTTPSConnectSOCKS5(p.Address, v.timeout) {
-			return false, latency, exitIP, exitLocation
+			return false, latency, exitIP, exitLocation, FailKindTLS
 		}
 	}
 
-	return true, latency, exitIP, exitLocation
+	return true, latency, exitIP, exitLocation, ""
 }
 
 func newHTTPClient(address string, timeout time.Duration) (*http.Client, error) {

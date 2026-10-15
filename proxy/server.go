@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -255,9 +256,15 @@ func (s *Server) handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 		conn, err := s.dialViaProxy(p, r.Host)
 		if err != nil {
-			log.Printf("[tunnel] dial %s via %s failed: %v, removing", r.Host, p.Address, err)
+			log.Printf("[tunnel] dial %s via %s failed: %v", r.Host, p.Address, err)
 			s.storage.RecordProxyUse(p.Address, false)
-			removeOrDisableProxy(s.storage, p)
+			maxFail := s.cfg.MaxFailCount
+			if maxFail <= 0 {
+				maxFail = 3
+			}
+			if p.FailCount+1 >= maxFail {
+				removeOrDisableProxy(s.storage, p)
+			}
 			continue
 		}
 
@@ -315,7 +322,26 @@ func (s *Server) dialViaProxy(p *storage.Proxy, host string) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return dialer.Dial("tcp", host)
+		if cd, ok := dialer.(proxy.ContextDialer); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			return cd.DialContext(ctx, "tcp", host)
+		}
+		type res struct {
+			c   net.Conn
+			err error
+		}
+		ch := make(chan res, 1)
+		go func() {
+			c, err := dialer.Dial("tcp", host)
+			ch <- res{c, err}
+		}()
+		select {
+		case r := <-ch:
+			return r.c, r.err
+		case <-time.After(timeout):
+			return nil, fmt.Errorf("socks5 dial %s timeout", host)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", p.Protocol)
 	}

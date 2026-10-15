@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"goproxy/config"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -306,7 +308,7 @@ func (s *Storage) GetRandom() (*Proxy, error) {
 	rows, err := s.db.Query(
 		`SELECT `+proxyColumns+`
 		 FROM proxies
-		 WHERE status = 'active' AND fail_count < 3
+		 WHERE status = 'active' AND `+failCountFilter()+`
 		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)
 		 ORDER BY
 		   CASE quality_grade
@@ -332,6 +334,15 @@ func (s *Storage) GetRandom() (*Proxy, error) {
 // proxyColumns 代理表查询的标准列列表
 const proxyColumns = `id, address, protocol, exit_ip, exit_location, latency, quality_grade,
 	use_count, success_count, fail_count, last_used, last_check, created_at, status, source, subscription_id, cooldown_until, eof_count`
+
+// failCountFilter 可用节点过滤：与 MaxFailCount 联动，不再硬编码 3
+func failCountFilter() string {
+	maxFail := 3
+	if cfg := config.Get(); cfg != nil && cfg.MaxFailCount > 0 {
+		maxFail = cfg.MaxFailCount
+	}
+	return fmt.Sprintf("fail_count < %d", maxFail)
+}
 
 // scanProxy 扫描代理行数据
 func scanProxy(rows *sql.Rows) (*Proxy, error) {
@@ -374,7 +385,7 @@ func (s *Storage) GetAll() ([]Proxy, error) {
 func (s *Storage) GetAllFiltered(sourceFilter string) ([]Proxy, error) {
 	query := `SELECT ` + proxyColumns + `
 		 FROM proxies
-		 WHERE status IN ('active', 'degraded') AND fail_count < 3
+		 WHERE status IN ('active', 'degraded') AND ` + failCountFilter() + `
 		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)`
 	var args []interface{}
 	if sourceFilter != "" {
@@ -609,12 +620,9 @@ func (s *Storage) Delete(address string) error {
 	return err
 }
 
-// IncrFail 增加失败次数
+// IncrFail 增加失败次数（旧 checker 兼容入口，内部走原子实现）
 func (s *Storage) IncrFail(address string) error {
-	_, err := s.db.Exec(
-		`UPDATE proxies SET fail_count = fail_count + 1, last_check = CURRENT_TIMESTAMP WHERE address = ?`,
-		address,
-	)
+	_, err := s.IncrementFailCountRet(address)
 	return err
 }
 
@@ -778,7 +786,7 @@ func (s *Storage) GetQualityDistribution() (map[string]int, error) {
 	rows, err := s.db.Query(
 		`SELECT quality_grade, COUNT(*) as count 
 		 FROM proxies 
-		 WHERE status = 'active' AND fail_count < 3
+		 WHERE status = 'active' AND `+failCountFilter()+`
 		 GROUP BY quality_grade`,
 	)
 	if err != nil {
@@ -803,7 +811,7 @@ func (s *Storage) GetQualityDistribution() (map[string]int, error) {
 func (s *Storage) GetBatchForHealthCheck(batchSize int) ([]Proxy, error) {
 	query := `SELECT ` + proxyColumns + `
 		 FROM proxies
-		 WHERE status IN ('active', 'degraded') AND fail_count < 3
+		 WHERE status IN ('active', 'degraded') AND ` + failCountFilter() + `
 		   AND (cooldown_until IS NULL OR cooldown_until <= CURRENT_TIMESTAMP)`
 
 	query += ` ORDER BY
@@ -963,7 +971,7 @@ func (s *Storage) DisableNotAllowedCountries(allowedCodes []string) (int64, erro
 func (s *Storage) Count() (int, error) {
 	var count int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM proxies WHERE status IN ('active', 'degraded') AND fail_count < 3 AND source = 'free'`,
+		`SELECT COUNT(*) FROM proxies WHERE status IN ('active', 'degraded') AND `+failCountFilter()+` AND source = 'free'`,
 	).Scan(&count)
 	return count, err
 }
@@ -972,7 +980,7 @@ func (s *Storage) Count() (int, error) {
 func (s *Storage) CountAll() (int, error) {
 	var count int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM proxies WHERE status IN ('active', 'degraded') AND fail_count < 3`,
+		`SELECT COUNT(*) FROM proxies WHERE status IN ('active', 'degraded') AND `+failCountFilter(),
 	).Scan(&count)
 	return count, err
 }
@@ -981,19 +989,29 @@ func (s *Storage) CountAll() (int, error) {
 func (s *Storage) CountByProtocol(protocol string) (int, error) {
 	var count int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM proxies WHERE status IN ('active', 'degraded') AND fail_count < 3 AND source = 'free' AND protocol = ?`,
+		`SELECT COUNT(*) FROM proxies WHERE status IN ('active', 'degraded') AND `+failCountFilter()+` AND source = 'free' AND protocol = ?`,
 		protocol,
 	).Scan(&count)
 	return count, err
 }
 
-// IncrementFailCount 增加失败次数
-func (s *Storage) IncrementFailCount(address string) error {
-	_, err := s.db.Exec(
+// IncrementFailCountRet fail_count 原子 +1 并返回新值（判死用实时值）
+func (s *Storage) IncrementFailCountRet(address string) (int, error) {
+	res, err := s.db.Exec(
 		`UPDATE proxies SET fail_count = fail_count + 1 WHERE address = ?`,
 		address,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return 0, fmt.Errorf("proxy %s not found", address)
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT fail_count FROM proxies WHERE address = ?`, address).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 // GetByProtocol 按协议获取代理列表
@@ -1001,7 +1019,7 @@ func (s *Storage) GetByProtocol(protocol string) ([]Proxy, error) {
 	rows, err := s.db.Query(
 		`SELECT `+proxyColumns+`
 		 FROM proxies
-		 WHERE status IN ('active', 'degraded') AND fail_count < 3 AND protocol = ?
+		 WHERE status IN ('active', 'degraded') AND `+failCountFilter()+` AND protocol = ?
 		 ORDER BY latency ASC`, protocol,
 	)
 	if err != nil {
@@ -1099,7 +1117,7 @@ func (s *Storage) GetDisabledCustomProxies() ([]Proxy, error) {
 func (s *Storage) CountBySource(source string) (int, error) {
 	var count int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM proxies WHERE source = ? AND status IN ('active', 'degraded') AND fail_count < 3`,
+		`SELECT COUNT(*) FROM proxies WHERE source = ? AND status IN ('active', 'degraded') AND `+failCountFilter(),
 		source,
 	).Scan(&count)
 	return count, err
@@ -1166,7 +1184,7 @@ func (s *Storage) AddSubscription(name, url, filePath, format string, refreshMin
 // CountBySubscriptionID 统计指定订阅的可用/禁用代理数
 func (s *Storage) CountBySubscriptionID(subID int64) (active int, disabled int) {
 	s.db.QueryRow(
-		`SELECT COUNT(*) FROM proxies WHERE subscription_id = ? AND status IN ('active', 'degraded') AND fail_count < 3`,
+		`SELECT COUNT(*) FROM proxies WHERE subscription_id = ? AND status IN ('active', 'degraded') AND `+failCountFilter(),
 		subID,
 	).Scan(&active)
 	s.db.QueryRow(

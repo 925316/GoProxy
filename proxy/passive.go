@@ -31,7 +31,20 @@ type targetStat struct {
 	stallNodes map[string]bool // distinct upstreams that stalled on this target
 	stalls     int
 	lastSeen   time.Time
+	failNodes  map[string]bool // distinct upstreams that failed dial on this target
+	fails      int             // failed attempts in current dead-window
+	windowFrom time.Time       // start of current dead-window
+	deadUntil  time.Time       // zero if not dead; otherwise fast-fail until then
 }
+
+// Dead-target gate thresholds: a target failing across many distinct nodes in
+// a short window is blocked upstream (e.g. site-wide IP ban), not node garbage.
+const (
+	targetDeadWindow  = 60 * time.Second // failure accumulation window
+	targetDeadMinFail = 6                // minimum failed attempts in window
+	targetDeadMinNode = 3                // minimum distinct nodes that failed
+	targetDeadTTL     = 45 * time.Second // fast-fail duration once marked dead
+)
 
 // 站点级丢包判定：多个不同节点在同一目标集体 stall 才豁免节点。
 // 单个节点主导流量时（nodes 少）不会触发豁免，照罚。
@@ -357,10 +370,86 @@ func (ps *PassiveScorer) statLocked(address string) *nodeStat {
 func (ps *PassiveScorer) targetStatLocked(target string) *targetStat {
 	st, ok := ps.targets[target]
 	if !ok {
-		st = &targetStat{nodes: map[string]bool{}, stallNodes: map[string]bool{}}
+		st = &targetStat{nodes: map[string]bool{}, stallNodes: map[string]bool{}, failNodes: map[string]bool{}}
 		ps.targets[target] = st
 	}
+	if st.failNodes == nil {
+		st.failNodes = make(map[string]bool)
+	}
 	return st
+}
+
+// NoteTargetFail records a failed attempt on target (dial fail or zero-down
+// tunnel). Once many distinct nodes fail within one window the target is
+// marked dead so future CONNECTs fast-fail without burning more nodes.
+func (ps *PassiveScorer) NoteTargetFail(target, address string) {
+	if target == "" {
+		return
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	t := ps.targetStatLocked(target)
+	now := time.Now()
+	if !t.deadUntil.IsZero() {
+		if now.Before(t.deadUntil) {
+			return // already dead; keep the fast-fail without counting
+		}
+		// TTL expired: give the target a fresh probe window
+		t.deadUntil = time.Time{}
+		t.fails = 0
+		t.failNodes = make(map[string]bool)
+	}
+	if t.windowFrom.IsZero() || now.Sub(t.windowFrom) > targetDeadWindow {
+		t.windowFrom = now
+		t.fails = 0
+		t.failNodes = make(map[string]bool)
+	}
+	t.fails++
+	if address != "" {
+		t.failNodes[address] = true
+	}
+	if t.fails >= targetDeadMinFail && len(t.failNodes) >= targetDeadMinNode {
+		t.deadUntil = now.Add(targetDeadTTL)
+		log.Printf("[passive] target %s marked dead for %v: %d fails across %d nodes",
+			target, targetDeadTTL, t.fails, len(t.failNodes))
+	}
+}
+
+// TargetDead reports whether target is in its fast-fail window; expiry resets
+// the failure window so a single late probe decides revival.
+func (ps *PassiveScorer) TargetDead(target string) bool {
+	if target == "" {
+		return false
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	t, ok := ps.targets[target]
+	if !ok || t.deadUntil.IsZero() {
+		return false
+	}
+	if time.Now().Before(t.deadUntil) {
+		return true
+	}
+	t.deadUntil = time.Time{}
+	t.fails = 0
+	t.windowFrom = time.Time{}
+	t.failNodes = make(map[string]bool)
+	return false
+}
+
+// NoteTargetSuccess clears the dead state: one working tunnel revives the target.
+func (ps *PassiveScorer) NoteTargetSuccess(target string) {
+	if target == "" {
+		return
+	}
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	if t, ok := ps.targets[target]; ok {
+		t.deadUntil = time.Time{}
+		t.fails = 0
+		t.windowFrom = time.Time{}
+		t.failNodes = make(map[string]bool)
+	}
 }
 
 // parkStall stall/no-response 直冷 300s：黑洞不等指数退避爬坡

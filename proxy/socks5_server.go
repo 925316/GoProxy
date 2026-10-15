@@ -74,6 +74,14 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		return
 	}
 
+	// Dead-target fast-fail: blocked sites would otherwise burn nodes via
+	// dial loops, fail_count deletion and stall parks on every retry.
+	if GetScorer().TargetDead(target) {
+		log.Printf("[socks5] target %s marked dead, fast-fail", target)
+		s.sendSOCKS5Reply(clientConn, 0x04) // Host unreachable
+		return
+	}
+
 	// 带重试的连接上游代理
 	// 重试机制：只使用 SOCKS5 协议的上游代理（天然支持 HTTPS）
 	tried := []string{}
@@ -105,6 +113,7 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		if err != nil {
 			log.Printf("[socks5] dial %s via %s (%s) failed: %v", target, p.Address, p.Protocol, err)
 			s.storage.RecordProxyUse(p.Address, false)
+			GetScorer().NoteTargetFail(target, p.Address)
 			// 不再一次拨失败就删：客户端重试链路（cli-proxy-api 每请求最多
 			// 4 轮 x 连接内 5 次 dial）会把整个池子一次删干。攒满
 			// fail_count 才退场，死节点有界地死，不再批量蒸发。
@@ -129,6 +138,12 @@ func (s *SOCKS5Server) handleConnection(clientConn net.Conn) {
 		// 被动体检：双向转发 + 尸体上报（字节/时长/关闭方/关闭类型），关时再判
 		upBytes, downBytes, lifetime, closer, closeType := relayTunnel(upstreamConn, clientConn)
 		GetScorer().ReportTunnel(p.Address, target, lifetime, upBytes, downBytes, closer, closeType, s.storage, s.cfg)
+		// Data came back = target alive; sent but never answered = dead-ish.
+		if downBytes > 0 {
+			GetScorer().NoteTargetSuccess(target)
+		} else if upBytes > 0 {
+			GetScorer().NoteTargetFail(target, p.Address)
+		}
 		return
 	}
 
@@ -375,9 +390,16 @@ func (s *SOCKS5Server) sendSOCKS5Reply(conn net.Conn, rep byte) error {
 	return err
 }
 
+// serveDialCap bounds one dial+handshake attempt on the serving path so
+// retry cycles fit inside client first-event budgets (o2a gives 15s).
+const serveDialCap = 4 * time.Second
+
 // dialViaProxy 通过上游代理连接目标
 func (s *SOCKS5Server) dialViaProxy(p *storage.Proxy, target string) (net.Conn, error) {
 	timeout := time.Duration(s.cfg.ValidateTimeout) * time.Second
+	if timeout > serveDialCap {
+		timeout = serveDialCap
+	}
 	
 	switch p.Protocol {
 	case "http":
